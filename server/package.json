@@ -1,0 +1,29 @@
+{
+  "name": "server",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "start": "tsx src/index.ts",
+    "check": "tsc --noEmit",
+    "smoke": "tsx scripts/smoke.ts",
+    "smoke:enemy": "tsx scripts/smoke-enemy.ts",
+    "smoke:round": "tsx scripts/smoke-round.ts",
+    "smoke:shift": "tsx scripts/smoke-shift.ts",
+    "smoke:map": "tsx scripts/smoke-map.ts",
+    "smoke:stamina": "tsx scripts/smoke-stamina.ts",
+    "smoke:assembly": "tsx scripts/smoke-assembly.ts",
+    "smoke:voice": "tsx scripts/smoke-voice.ts"
+  },
+  "dependencies": {
+    "@colyseus/schema": "^3.0.76",
+    "colyseus": "0.16.5",
+    "tsx": "^4.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "colyseus.js": "^0.16.22",
+    "typescript": "^5.6.0"
+  }
+}

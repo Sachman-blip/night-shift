@@ -1,0 +1,21 @@
+{
+  "name": "night-shift",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Co-op horror extraction game - Three.js + Colyseus",
+  "workspaces": [
+    "server",
+    "client"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n server,client -c blue,green \"npm run dev -w server\" \"npm run dev -w client\"",
+    "dev:server": "npm run dev -w server",
+    "dev:client": "npm run dev -w client",
+    "start": "npm run start -w server",
+    "check": "npm run check -w server && npm run check -w client"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "puppeteer-core": "^25.3.0"
+  }
+}

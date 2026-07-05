@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover" />
+  <meta name="mobile-web-app-capable" content="yes" />
+  <title>NIGHT SHIFT</title>
+  <link rel="stylesheet" href="/src/style.css" />
+</head>
+<body>
+  <div id="menu">
+    <div class="panel">
+      <h1>NIGHT&nbsp;SHIFT</h1>
+      <p class="sub">the building closes at midnight. you don't.</p>
+
+      <label for="nameInput">CALLSIGN</label>
+      <input id="nameInput" maxlength="16" placeholder="EMPLOYEE" autocomplete="off" />
+
+      <button id="createBtn">START A SHIFT</button>
+
+      <div class="divider"><span>or join a coworker</span></div>
+
+      <div class="joinRow">
+        <input id="codeInput" maxlength="4" placeholder="CODE" autocomplete="off" />
+        <button id="joinBtn">JOIN</button>
+      </div>
+
+      <p id="menuError"></p>
+    </div>
+  </div>
+
+  <div id="hud" class="hidden">
+    <div id="topLeft">
+      <div>SHIFT&nbsp;<span id="roomCode">----</span></div>
+      <div><span id="playerCount">1</span>/4 on the clock</div>
+      <div id="teamList"></div>
+      <div id="objectives"></div>
+    </div>
+    <div id="topRight">
+      <div id="timer">--:--</div>
+      <div id="lootHud">
+        <span id="carryCount">0/3</span> CARRIED &middot;
+        <span id="bankCount">0/5</span> BANKED
+      </div>
+    </div>
+    <div id="crosshair"></div>
+    <div id="grabPrompt" class="hidden">[E] <span id="grabLabel"></span></div>
+    <div id="stamWrap"><div id="stamFill"></div></div>
+    <div id="micHud">MIC…</div>
+    <div id="toast"></div>
+    <div id="deathFlash">CAUGHT</div>
+    <div id="lockPrompt">click to look around</div>
+    <div id="hint">WASD move &middot; SHIFT run &middot; SPACE jump &middot; F flashlight &middot; E grab &middot; V mic</div>
+  </div>
+
+  <div id="touchUI" class="hidden">
+    <div id="stickBase"><div id="stickNub"></div></div>
+    <div id="touchButtons">
+      <button id="btnGrab">GRAB</button>
+      <button id="btnJump">JUMP</button>
+      <button id="btnTorch">LIGHT</button>
+      <button id="btnMic">MIC</button>
+    </div>
+  </div>
+  <div id="rotateHint">rotate your device<br /><span>this shift runs in landscape</span></div>
+
+  <div id="results" class="hidden">
+    <div class="panel">
+      <h1 id="resultsTitle">SHIFT COMPLETE</h1>
+      <p class="sub" id="resultsSub"></p>
+      <div id="resultsRows"></div>
+      <button id="againBtn">NEXT SHIFT</button>
+    </div>
+  </div>
+
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
