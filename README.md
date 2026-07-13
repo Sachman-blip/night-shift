@@ -4,6 +4,20 @@ Browser-based 1-4 player co-op horror extraction game (Lethal Company /
 Phasmophobia inspired). Three.js + Rapier on the client, Colyseus on the
 server, low-poly flat-shaded art carried by fog, lighting, and (later) sound.
 
+## Play it
+
+No install, no account. Open the link, press **START A SHIFT**, and send the
+4-letter room code to up to three friends. Runs in a desktop or phone browser.
+
+- **Play:** https://dist-sooty-ten-wrihij32v2.vercel.app
+- **Trailer:** https://night-shift-trailer.vercel.app
+
+Bring a mic and someone you trust. You each get one flashlight and three loot
+slots. Grab what you can, bank the quota at the loading dock, and get out before
+the six-minute clock runs down. Get caught and you drop your whole haul where
+you fall. The monster runs on the server, so nobody can peek through walls at
+it and it can't cheat you either.
+
 ## Run it
 
 ```bash
