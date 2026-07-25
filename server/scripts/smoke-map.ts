@@ -6,7 +6,7 @@
 import { Client, type Room } from "colyseus.js";
 import { ROOM_NAME, MSG } from "../../shared/messages";
 import { buildLayout, IDENTITY_LAYOUT, LOOT_COUNT } from "../../shared/map";
-import { ROUND_SECONDS } from "../../shared/loot";
+import { CARRY_CAPACITY, ROUND_SECONDS } from "../../shared/loot";
 import { createLos } from "../src/ai/los";
 import { createNav } from "../src/ai/nav";
 
@@ -16,6 +16,8 @@ const PARK = { x: -12, z: -6.75 }; // slot n0: never on the patrol route
 // sprint the honest sustained speed is walking, so this is the
 // conservative "no sprint management at all" pacing bound.
 const BOT_SPEED = 3.3;
+/** Value quota for the pacing bot — about seven average items' worth. */
+const PACE_QUOTA = 18;
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 const L = buildLayout(IDENTITY_LAYOUT);
@@ -26,12 +28,28 @@ const snap = (room: Room) => (room.state as any).toJSON();
 const me = (room: Room) => snap(room).players[room.sessionId];
 
 function sendPos(room: Room, x: number, z: number) {
-  room.send(MSG.Move, { x, y: 1.05, z, yaw: 0, pitch: 0, torch: false });
+  room.send(MSG.Move, {
+    x, y: 1.05, z, yaw: 0, pitch: 0, torch: false, crouch: false,
+  });
 }
 
 function assert(cond: unknown, label: string) {
   if (!cond) throw new Error(`assert failed: ${label}`);
   console.log(`  ok: ${label}`);
+}
+
+/**
+ * Poll a fresh snapshot until `pred` holds. State arrives in patches every
+ * PATCH_RATE_MS, so anything that waits a fixed number of milliseconds and
+ * then reads is racing the network — wait for the state itself instead.
+ */
+async function waitFor(pred: () => boolean, ms = 2000): Promise<boolean> {
+  const until = Date.now() + ms;
+  while (Date.now() < until) {
+    if (pred()) return true;
+    await sleep(25);
+  }
+  return pred();
 }
 
 async function main() {
@@ -74,7 +92,7 @@ async function main() {
 
     sendPos(room, L.keycardPos.x, L.keycardPos.z);
     room.send(MSG.Pickup);
-    await sleep(200);
+    await waitFor(() => snap(room).keycardTaken === true);
     let s = snap(room);
     assert(s.keycardTaken === true, "keycard taken");
     assert(s.archivesUnlocked === true, "archives unlocked by keycard");
@@ -82,14 +100,14 @@ async function main() {
 
     sendPos(room, L.breakerPos.x, L.breakerPos.z);
     room.send(MSG.Pickup);
-    await sleep(200);
+    await waitFor(() => snap(room).shortcutOpen === true);
     assert(snap(room).shortcutOpen === true, "breaker opens the shutter");
 
     // archive loot exists and is grabbable once inside
     const locked = L.lootCandidates.find((c) => c.locked)!;
     sendPos(room, locked.x, locked.z);
     room.send(MSG.Pickup);
-    await sleep(200);
+    await waitFor(() => me(room).carrying === 1);
     assert(me(room).carrying === 1, "archive loot pickup works");
     await room.leave();
   }
@@ -131,7 +149,7 @@ async function main() {
   console.log("[4] paced completability bot (walk-speed, nav-graph walking)");
   {
     const room = await new Client(ENDPOINT).create(ROOM_NAME, {
-      name: "Pacer", noEnemy: true, quota: 7, roundSeconds: ROUND_SECONDS,
+      name: "Pacer", noEnemy: true, quota: PACE_QUOTA, roundSeconds: ROUND_SECONDS,
       layout: IDENTITY_LAYOUT, variant: "stalker", enemies: 1,
     });
     await sleep(300);
@@ -165,10 +183,30 @@ async function main() {
       }
     }
 
-    async function grab(x: number, z: number) {
+    /**
+     * Walk to an item and take it. Success is "that specific item is in MY
+     * hands", read from state — not "my carry count went up by one after a
+     * sleep". Keying on the item makes the retry harmless: if the first
+     * pickup already landed, or a retry grabs a neighbour as well, neither
+     * turns into a spurious failure.
+     */
+    async function grab(id: string, x: number, z: number) {
       await walkTo(x, z);
-      room.send(MSG.Pickup);
-      await sleep(150);
+      const held = () =>
+        (snap(room).loot as Record<string, any>)[id]?.carrier === room.sessionId;
+      for (const attempt of [0, 1]) {
+        room.send(MSG.Pickup);
+        if (await waitFor(held, 1500)) return;
+        if (attempt === 1) {
+          const m = me(room);
+          const l = (snap(room).loot as Record<string, any>)[id];
+          throw new Error(
+            `pickup failed for ${id} at (${x}, ${z}): me=(${m.x.toFixed(2)}, ` +
+            `${m.z.toFixed(2)}) carrying=${m.carrying} phase=${snap(room).phase} ` +
+            `item[carrier=${JSON.stringify(l?.carrier)} extracted=${l?.extracted}]`
+          );
+        }
+      }
     }
 
     // loot picks are randomized per room: select targets from live state,
@@ -179,50 +217,40 @@ async function main() {
       l.carrier === "" && !l.extracted &&
       openWorld.has(nav.nearestVisibleNode(l.x, l.z));
 
+    // Quota is a VALUE target, so this is ~7 average items — the same amount
+    // of walking the old item-count quota of 7 asked for.
     let banked = 0;
-    while (banked < 7) {
-      const want = Math.min(3, 7 - banked);
-      for (let i = 0; i < want; i++) {
-        const ground = (Object.values(snap(room).loot) as any[])
-          .filter(eligible)
+    while (banked < PACE_QUOTA) {
+      for (let i = 0; i < CARRY_CAPACITY; i++) {
+        const ground = (Object.entries(snap(room).loot) as [string, any][])
+          .filter(([, l]) => eligible(l))
           .sort(
-            (a, b) =>
+            ([, a], [, b]) =>
               Math.hypot(a.x - pos.x, a.z - pos.z) -
               Math.hypot(b.x - pos.x, b.z - pos.z)
           );
         if (!ground.length) throw new Error("no eligible ground loot left");
-        const target = ground[0];
-        const before = me(room).carrying;
-        await grab(target.x, target.z);
-        if (me(room).carrying !== before + 1) {
-          room.send(MSG.Pickup); // retry once (patch-lag diagnosis)
-          await sleep(300);
-        }
-        if (me(room).carrying !== before + 1) {
-          const m = me(room);
-          const items = Object.entries(snap(room).loot)
-            .filter(([, l]: [string, any]) =>
-              Math.hypot(l.x - target.x, l.z - target.z) < 0.5)
-            .map(([id, l]: [string, any]) =>
-              `${id}: carrier=${JSON.stringify(l.carrier)} extracted=${l.extracted}`)
-            .join("; ");
-          throw new Error(
-            `pickup failed at (${target.x}, ${target.z}): me=(${m.x.toFixed(2)}, ` +
-            `${m.z.toFixed(2)}) carrying=${m.carrying} before=${before} ` +
-            `banked=${banked} phase=${snap(room).phase} item[${items}]`
-          );
-        }
+        const [id, target] = ground[0];
+        await grab(id, target.x, target.z);
       }
       await walkTo(L.extractionZone.x, L.extractionZone.z);
-      await sleep(400);
+      // banking is a server tick away, so wait for hands to actually empty
+      if (!(await waitFor(() => me(room).carrying === 0, 3000))) {
+        throw new Error(
+          `banking did not empty hands (carrying=${me(room).carrying}, ` +
+          `phase=${snap(room).phase})`
+        );
+      }
       banked = snap(room).extractedTotal;
-      if (me(room).carrying !== 0) throw new Error("banking did not empty hands");
     }
 
     const s = snap(room);
     const elapsed = (Date.now() - startedAt) / 1000;
     assert(s.phase === "ended" && s.win === true, "quota met -> WIN");
-    assert(s.extractedTotal === 7, "7 items extracted");
+    assert(
+      s.extractedTotal >= PACE_QUOTA,
+      `${PACE_QUOTA}+ value extracted (banked ${s.extractedTotal})`
+    );
     console.log(
       `  >> walk-speed known-map run: ${elapsed.toFixed(0)}s of ${ROUND_SECONDS}s ` +
       `(${((elapsed / ROUND_SECONDS) * 100).toFixed(0)}% of the timer)`
