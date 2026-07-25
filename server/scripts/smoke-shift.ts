@@ -15,7 +15,7 @@
 import { Client, type Room } from "colyseus.js";
 import { ROOM_NAME, MSG } from "../../shared/messages";
 import { buildLayout, IDENTITY_LAYOUT } from "../../shared/map";
-import { CARRY_CAPACITY, SOLO_MODE, planShift } from "../../shared/loot";
+import { CARRY_CAPACITY, SOLO_MODE, planShift, lootValue } from "../../shared/loot";
 
 const L = buildLayout(IDENTITY_LAYOUT);
 const EXTRACT = L.extractionZone;
@@ -31,6 +31,12 @@ const groundCount = (room: Room) =>
   Object.values(snap(room).loot).filter(
     (l: any) => l.carrier === "" && !l.extracted
   ).length;
+/** Total quota value sitting on the floor — what the room clamps quota to. */
+const mapValue = (room: Room) =>
+  (Object.values(snap(room).loot) as any[]).reduce(
+    (sum, l) => sum + lootValue(l.kind),
+    0
+  );
 
 function sendPos(room: Room, x: number, z: number) {
   room.send(MSG.Move, { x, y: 1.05, z, yaw: 0, pitch: 0, torch: false });
@@ -95,7 +101,9 @@ function assertPlan(room: Room, shift: number) {
   const plan = planShift(shift, SOLO_MODE, 2);
   const s = snap(room);
   assert(s.shift === shift, `state.shift === ${shift}`);
-  assert(s.quota === plan.quota, `quota === ${plan.quota} (plan)`);
+  // quota is a value target clamped to what the rolled loot is actually worth
+  const wantQuota = Math.min(plan.quota, mapValue(room));
+  assert(s.quota === wantQuota, `quota === ${wantQuota} (plan, clamped to map value)`);
   assert(
     s.timeLeft >= plan.seconds - 5 && s.timeLeft <= plan.seconds,
     `timer ~${plan.seconds}s (timeLeft=${s.timeLeft})`
@@ -110,27 +118,30 @@ async function main() {
   {
     const p1 = planShift(1, SOLO_MODE, 2);
     assert(
-      p1.loot === 15 && p1.quota === 10 && p1.seconds === 360 && p1.enemies === 2,
-      "shift 1 solo = 15 loot / quota 10 / 360s / 2 enemies"
+      p1.loot === 15 && p1.quota === 24 && p1.seconds === 360 && p1.enemies === 2,
+      "shift 1 solo = 15 loot / quota 24 value / 360s / 2 enemies"
     );
     const p2 = planShift(2, SOLO_MODE, 2);
     assert(
-      p2.loot === 17 && p2.quota === 12 && p2.seconds === 340 && p2.enemies === 2,
-      "shift 2 = 17 / 12 / 340s / 2"
+      p2.loot === 17 && p2.quota === 29 && p2.seconds === 340 && p2.enemies === 2,
+      "shift 2 = 17 / 29 / 340s / 2"
     );
     const p3 = planShift(3, SOLO_MODE, 2);
     assert(
-      p3.loot === 19 && p3.quota === 14 && p3.seconds === 320 && p3.enemies === 3,
+      p3.loot === 19 && p3.quota === 34 && p3.seconds === 320 && p3.enemies === 3,
       "shift 3 adds a third monster"
     );
     const deep = planShift(50, SOLO_MODE, 2);
     assert(
-      deep.loot === 26 && deep.quota === 26 && deep.seconds === 120 && deep.enemies === 3,
-      "deep shift saturates at 26 loot / quota 26 / 120s floor / 3 enemies"
+      deep.loot === 26 && deep.seconds === 120 && deep.enemies === 3,
+      "deep shift saturates at 26 loot / 120s floor / 3 enemies"
     );
+    // planShift no longer clamps quota itself: it is a VALUE target and only
+    // the room knows what the rolled loot is actually worth, so the room
+    // clamps it to the value on the floor. Section 2 asserts that clamp.
     assert(
-      deep.quota <= deep.loot,
-      "quota never exceeds loot on the map (feasible)"
+      deep.quota > planShift(1, SOLO_MODE, 2).quota,
+      "quota keeps climbing with the shift"
     );
   }
 
@@ -191,7 +202,10 @@ async function main() {
     room2.send(MSG.Restart);
     await waitFor(room2, "restarted", (s) => s.phase === "active", 3000);
     assert(snap(room2).shift === 1, "failed shift repeats (still shift 1)");
-    assert(snap(room2).quota === planShift(1, SOLO_MODE, 2).quota, "same quota on retry");
+    assert(
+      snap(room2).quota === Math.min(planShift(1, SOLO_MODE, 2).quota, mapValue(room2)),
+      "same shift-1 quota on retry"
+    );
     assert(enemyCount(room2) === 2, "no extra monster added on a retry");
     await room2.leave();
   }

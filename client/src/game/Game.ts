@@ -10,19 +10,34 @@ import { getStateCallbacks, type Room } from "colyseus.js";
 import {
   MSG,
   MOVE_SEND_RATE_MS,
+  BATTERY_LOW,
+  BLEED_OUT_SECONDS,
+  REVIVE_RADIUS,
+  DOOR_INTERACT_RADIUS,
+  NOISE_CROUCH,
+  NOISE_WALK,
+  NOISE_SPRINT,
   type PlayerState,
   type DeathMessage,
   type TeleportMessage,
+  type ForcedMessage,
   type RoundPhase,
 } from "../../../shared/messages";
-import { CARRY_CAPACITY, PICKUP_RADIUS } from "../../../shared/loot";
+import {
+  PICKUP_RADIUS,
+  UPGRADES,
+  upgradeCost,
+  carryCapacityFor,
+  staminaDrainScaleFor,
+} from "../../../shared/loot";
 import { buildLayout, INTERACT_RADIUS, type Layout } from "../../../shared/map";
-import { buildMap, updateFlickers, type BuiltMap } from "./buildMap";
+import { buildMap, disposeMap, updateFlickers, type BuiltMap } from "./buildMap";
 import { PlayerController } from "./PlayerController";
 import { RemotePlayers } from "./RemotePlayers";
 import { EnemyView } from "./EnemyView";
 import { LootView } from "./LootView";
 import { GateView } from "./GateView";
+import { DoorView } from "./DoorView";
 import { TouchControls } from "./TouchControls";
 import { AudioEngine } from "./audio";
 import { VoiceChat } from "./voice";
@@ -32,6 +47,17 @@ import { VoiceChat } from "./voice";
 const IS_TOUCH =
   matchMedia("(pointer: coarse)").matches ||
   new URLSearchParams(location.search).has("touch");
+
+const FLASHLIGHT_INTENSITY = 30;
+/** How often to tell the server we're still holding a revive. */
+const REVIVE_SEND_MS = 100;
+
+/** What pressing interact would do right now. */
+type InteractKind = "revive" | "pickup" | "door";
+interface InteractTarget {
+  kind: InteractKind;
+  label: string;
+}
 
 export class Game {
   private renderer!: THREE.WebGLRenderer;
@@ -47,26 +73,32 @@ export class Game {
   private clock = new THREE.Clock();
   private elapsed = 0;
   private sendAccumulator = 0;
+  private reviveAccumulator = 0;
   private running = false;
   private prevPhase: RoundPhase = "active";
   private teamListHtml = "";
   private objectivesHtml = "";
+  private shopHtml = "";
   private gateView!: GateView;
+  private doorView!: DoorView;
   private audio = new AudioEngine();
   private prevCarrying = 0;
   private prevExtractedTotal = 0;
   private prevArchives = false;
   private prevShortcut = false;
+  private prevDowned = false;
+  private prevDoors: boolean[] = [];
   private ambientIn = 20;
   private composer!: EffectComposer;
   private grainPass!: ShaderPass;
   private frameTimes: number[] = [];
   private panic = 0;
   private voice!: VoiceChat;
+  private layout!: Layout;
+  /** Descriptor JSON the world was built from; a change means a new shift. */
+  private layoutJson = "";
 
   constructor(private room: Room) {}
-
-  private layout!: Layout;
 
   async start() {
     await RAPIER.init();
@@ -78,15 +110,9 @@ export class Game {
 
     // the first state patch carries both our spawn AND the map layout
     const self = await this.waitForSelfState();
-    this.layout = buildLayout(JSON.parse((this.room.state as any).layout));
+    this.buildWorld((this.room.state as any).layout);
 
-    this.map = buildMap(this.scene, this.world, RAPIER, this.layout.boxes, this.layout.lights);
     this.remotes = new RemotePlayers(this.scene);
-    this.lootView = new LootView(this.scene, this.layout.extractionZone);
-    this.gateView = new GateView(
-      this.scene, this.world, RAPIER,
-      this.layout.gateDoors, this.layout.keycardPos, this.layout.breakerPos
-    );
     this.controller = new PlayerController(
       this.world,
       RAPIER,
@@ -94,14 +120,16 @@ export class Game {
       { x: self.x, y: self.y, z: self.z },
       this.renderer.domElement
     );
-    this.controller.onInteract = () => this.room.send(MSG.Pickup);
-    this.controller.onStep = (sprinting) => this.audio.step(sprinting);
+    this.controller.onInteract = () => this.interact();
+    this.controller.onSwapCell = () => this.room.send(MSG.Swap);
+    this.controller.onStep = (sprinting, crouching) =>
+      this.audio.step(sprinting, crouching);
     if (IS_TOUCH) {
       document.body.classList.add("touch");
       document.getElementById("touchUI")!.classList.remove("hidden");
       this.controller.touchMode = true;
       new TouchControls(this.controller, {
-        onInteract: () => this.room.send(MSG.Pickup),
+        onInteract: () => this.interact(),
       });
       document.getElementById("btnMic")!.addEventListener("touchstart", (e) => {
         e.preventDefault();
@@ -153,6 +181,44 @@ export class Game {
         voice: this.voice,
       };
     }
+  }
+
+  // ---------- world build / rebuild ----------
+
+  /** Expand a layout descriptor into meshes, colliders and interactables. */
+  private buildWorld(layoutJson: string) {
+    this.layoutJson = layoutJson;
+    this.layout = buildLayout(JSON.parse(layoutJson));
+    this.map = buildMap(
+      this.scene, this.world, RAPIER, this.layout.boxes, this.layout.lights
+    );
+    this.lootView = new LootView(this.scene, this.layout.extractionZone);
+    this.gateView = new GateView(
+      this.scene, this.world, RAPIER,
+      this.layout.gateDoors, this.layout.keycardPos, this.layout.breakerPos
+    );
+    this.doorView = new DoorView(this.scene, this.world, RAPIER, this.layout.doors);
+    this.prevDoors = this.layout.doors.map(() => true);
+  }
+
+  /**
+   * A new shift re-rolls the building. Everything geometric is torn down and
+   * rebuilt from the new descriptor; the player is dropped on whatever spawn
+   * the server has already assigned them.
+   */
+  private rebuildWorld(layoutJson: string) {
+    disposeMap(this.scene, this.world, this.map);
+    this.lootView.dispose();
+    this.gateView.dispose(this.scene);
+    this.doorView.dispose(this.scene);
+
+    this.buildWorld(layoutJson);
+
+    const self = (this.room.state as any).players.get(this.room.sessionId);
+    if (self) this.controller.teleport(self.x, 1.05, self.z);
+    this.prevArchives = false;
+    this.prevShortcut = false;
+    this.toast("THE FLOOR PLAN IS NOT THE ONE YOU LEARNED");
   }
 
   // ---------- setup ----------
@@ -242,7 +308,9 @@ export class Game {
     // Lower intensity + gentler decay (1.6 vs inverse-square 2) so a wall right
     // in your face isn't blinding, while mid-range visibility stays about the
     // same; wider penumbra softens the hotspot.
-    this.flashlight = new THREE.SpotLight(0xffe9c4, 30, 24, 0.46, 0.52, 1.6);
+    this.flashlight = new THREE.SpotLight(
+      0xffe9c4, FLASHLIGHT_INTENSITY, 24, 0.46, 0.52, 1.6
+    );
     this.flashlight.position.set(0.18, -0.22, 0);
     this.flashlight.target.position.set(0, -0.12, -4);
     this.flashlight.castShadow = true;
@@ -289,6 +357,17 @@ export class Game {
       this.controller.teleport(msg.x, 1.05, msg.z);
     });
 
+    // a monster tore a door off somewhere in the building
+    this.room.onMessage(MSG.Forced, (msg: ForcedMessage) => {
+      this.doorView.slam(msg.index);
+      this.audio.sting("forced");
+      const d = Math.hypot(
+        msg.x - this.camera.position.x,
+        msg.z - this.camera.position.z
+      );
+      if (d < 18) this.toast("SOMETHING JUST CAME THROUGH A DOOR");
+    });
+
     this.room.onLeave(() => {
       this.running = false;
       this.renderer.setAnimationLoop(null);
@@ -310,7 +389,69 @@ export class Game {
       yaw: this.controller.yaw,
       pitch: this.controller.pitch,
       torch: this.controller.torch,
+      crouch: this.controller.ducking,
     });
+  }
+
+  // ---------- interaction ----------
+
+  /**
+   * What interact means right now. Both the prompt and the keypress read this,
+   * so the HUD can never promise something the press won't do. Order is by
+   * urgency: a teammate on the floor beats anything else in the room.
+   */
+  private interactTarget(st: any, self: any): InteractTarget | null {
+    if (st.phase !== "active" || !self || self.downed) return null;
+
+    let downedName: string | null = null;
+    let bestD = REVIVE_RADIUS;
+    st.players.forEach((p: any, id: string) => {
+      if (id === this.room.sessionId || !p.downed) return;
+      const d = Math.hypot(p.x - self.x, p.z - self.z);
+      if (d <= bestD) {
+        bestD = d;
+        downedName = p.name;
+      }
+    });
+    if (downedName) {
+      return { kind: "revive", label: `HOLD TO PULL UP ${downedName}` };
+    }
+
+    const { keycardPos, breakerPos } = this.layout;
+    if (
+      !st.keycardTaken &&
+      Math.hypot(keycardPos.x - self.x, keycardPos.z - self.z) <= INTERACT_RADIUS
+    ) {
+      return { kind: "pickup", label: "TAKE SECURITY CARD" };
+    }
+    if (
+      !st.shortcutOpen &&
+      Math.hypot(breakerPos.x - self.x, breakerPos.z - self.z) <= INTERACT_RADIUS
+    ) {
+      return { kind: "pickup", label: "REROUTE POWER" };
+    }
+
+    const near = this.lootView.nearestGround(st.loot, self.x, self.z);
+    const capacity = carryCapacityFor(st.upgrades.get("capacity") ?? 0);
+    if (near.dist <= PICKUP_RADIUS && self.carrying < capacity) {
+      return { kind: "pickup", label: `GRAB ${near.label} (${near.value})` };
+    }
+
+    const door = this.doorView.nearest(self.x, self.z);
+    if (door.index >= 0 && door.dist <= DOOR_INTERACT_RADIUS) {
+      return { kind: "door", label: door.open ? "SHUT THE DOOR" : "OPEN THE DOOR" };
+    }
+    return null;
+  }
+
+  private interact() {
+    const st = this.room.state as any;
+    const self = st.players.get(this.room.sessionId);
+    const target = this.interactTarget(st, self);
+    if (!target) return;
+    // revives are a hold, driven per-frame from tick(); a tap does nothing
+    if (target.kind === "revive") return;
+    this.room.send(target.kind === "door" ? MSG.Door : MSG.Pickup);
   }
 
   // ---------- per-frame ----------
@@ -337,6 +478,15 @@ export class Game {
     this.elapsed += dt;
     const st = this.room.state as any;
     const active = st.phase === "active";
+    const self = st.players.get(this.room.sessionId);
+
+    // a new shift re-rolls the building under our feet
+    if (st.layout && st.layout !== this.layoutJson) this.rebuildWorld(st.layout);
+
+    this.controller.downed = !!self?.downed;
+    this.controller.staminaDrainScale = staminaDrainScaleFor(
+      st.upgrades.get("lungs") ?? 0
+    );
 
     if (active) {
       this.controller.update(dt);
@@ -347,7 +497,19 @@ export class Game {
       }
     }
 
-    this.flashlight.visible = this.controller.torch;
+    const target = this.interactTarget(st, self);
+    // holding interact on a downed teammate feeds revive progress
+    this.reviveAccumulator += dt * 1000;
+    if (
+      active && target?.kind === "revive" &&
+      this.controller.interactHeld &&
+      this.reviveAccumulator >= REVIVE_SEND_MS
+    ) {
+      this.reviveAccumulator = 0;
+      this.room.send(MSG.Revive);
+    }
+
+    this.updateFlashlight(self);
     this.remotes.update(dt);
     st.enemies.forEach((e: any, id: string) => {
       let view = this.enemyViews.get(id);
@@ -360,6 +522,8 @@ export class Game {
     });
     this.lootView.sync(st.loot, this.elapsed, dt);
     this.gateView.sync(st);
+    this.doorView.sync(st.doors, dt);
+    this.syncDoorAudio(st);
     updateFlickers(this.map.flickers, dt);
 
     // gate unlock feedback
@@ -404,9 +568,12 @@ export class Game {
     });
     this.audio.update(enemyDist, enemyChasing, active, dt);
 
-    // close-chase panic: camera breathing + vignette/grain surge
-    const panicTarget =
-      active && enemyChasing
+    // close-chase panic: camera breathing + vignette/grain surge. Being on
+    // the floor bleeding out is its own kind of panic.
+    const downed = !!self?.downed;
+    const panicTarget = downed
+      ? 0.75
+      : active && enemyChasing
         ? Math.max(0, Math.min(1, 1 - enemyDist / 7))
         : 0;
     this.panic += (panicTarget - this.panic) * Math.min(1, dt * 4);
@@ -418,12 +585,19 @@ export class Game {
     this.grainPass.uniforms.uPanic.value = this.panic;
 
     // stingers from state diffs (works for events caused by any tick)
-    const self = st.players.get(this.room.sessionId);
     const carrying = self?.carrying ?? 0;
     if (carrying > this.prevCarrying) this.audio.sting("pickup");
     this.prevCarrying = carrying;
     if (st.extractedTotal > this.prevExtractedTotal) this.audio.sting("bank");
     this.prevExtractedTotal = st.extractedTotal;
+
+    if (downed && !this.prevDowned) {
+      this.flashDeath();
+      this.audio.sting("death");
+    } else if (!downed && this.prevDowned) {
+      this.audio.sting("revive");
+    }
+    this.prevDowned = downed;
 
     if (st.phase !== this.prevPhase) {
       this.prevPhase = st.phase;
@@ -435,7 +609,7 @@ export class Game {
       }
     }
 
-    this.updateHud(st, active);
+    this.updateHud(st, active, self, target);
 
     this.grainPass.uniforms.uTime.value = this.elapsed;
     this.composer.render();
@@ -445,7 +619,41 @@ export class Game {
     if (this.frameTimes.length > 240) this.frameTimes.shift();
   }
 
-  private updateHud(st: any, active: boolean) {
+  /** Beam dies with the cell, and browns out audibly before it does. */
+  private updateFlashlight(self: any) {
+    const battery = self?.battery ?? 1;
+    if (battery <= 0) this.controller.torch = false;
+    const lit = this.controller.torch && battery > 0;
+    this.flashlight.visible = lit;
+    if (!lit) return;
+    if (battery < BATTERY_LOW) {
+      const t = battery / BATTERY_LOW;
+      const stutter = Math.random() < 0.07 ? 0.12 : 1;
+      this.flashlight.intensity = FLASHLIGHT_INTENSITY * (0.3 + 0.7 * t) * stutter;
+    } else {
+      this.flashlight.intensity = FLASHLIGHT_INTENSITY;
+    }
+  }
+
+  /** Wooden thud whenever a door near you swings shut by hand. */
+  private syncDoorAudio(st: any) {
+    const doors = st.doors;
+    if (!doors) return;
+    for (let i = 0; i < this.prevDoors.length; i++) {
+      const open = doors[i] !== false;
+      if (!open && this.prevDoors[i]) {
+        const d = this.layout.doors[i];
+        const dist = Math.hypot(
+          d.x - this.camera.position.x,
+          d.z - this.camera.position.z
+        );
+        if (dist < 14) this.audio.sting("door");
+      }
+      this.prevDoors[i] = open;
+    }
+  }
+
+  private updateHud(st: any, active: boolean, self: any, target: InteractTarget | null) {
     document.getElementById("playerCount")!.textContent = String(
       this.remotes.count + 1
     );
@@ -461,12 +669,23 @@ export class Game {
       `${String(t % 60).padStart(2, "0")}`;
     timerEl.classList.toggle("low", active && t <= 60);
 
-    // loot counters
-    const self = st.players.get(this.room.sessionId);
+    // loot counters (banked is VALUE, not item count)
+    const capacity = carryCapacityFor(st.upgrades.get("capacity") ?? 0);
     document.getElementById("carryCount")!.textContent =
-      `${self?.carrying ?? 0}/${CARRY_CAPACITY}`;
+      `${self?.carrying ?? 0}/${capacity}`;
     document.getElementById("bankCount")!.textContent =
       `${st.extractedTotal}/${st.quota}`;
+
+    // flashlight cell
+    const battery = self?.battery ?? 1;
+    const cells = self?.cells ?? 0;
+    const batEl = document.getElementById("batteryHud")!;
+    batEl.textContent = `BEAM ${Math.round(battery * 100)}%`;
+    batEl.classList.toggle("low", battery > 0 && battery < BATTERY_LOW);
+    batEl.classList.toggle("dead", battery <= 0);
+    const cellEl = document.getElementById("cellsHud")!;
+    cellEl.textContent = `${cells} CELL${cells === 1 ? "" : "S"}`;
+    cellEl.classList.toggle("none", cells === 0);
 
     // mic state indicator
     const micEl = document.getElementById("micHud")!;
@@ -475,13 +694,14 @@ export class Game {
     if (micEl.textContent !== micText) micEl.textContent = micText;
     micEl.classList.toggle("muted", micState !== "live");
 
-    // teammates: name, carried count, deaths, talking indicator
+    // teammates: name, carried count, deaths, downed, talking indicator
     let html = "";
     st.players.forEach((p: any, id: string) => {
       const you = id === this.room.sessionId ? " (you)" : "";
       const deaths = p.deaths > 0 ? ` <span class="dead">✕${p.deaths}</span>` : "";
       const talk = this.voice?.isSpeaking(id) ? ` <span class="talk">◉</span>` : "";
-      html += `<div>${escapeHtml(p.name)}${you} · ${p.carrying}/${CARRY_CAPACITY}${deaths}${talk}</div>`;
+      const down = p.downed ? ` <span class="down">▼ DOWN</span>` : "";
+      html += `<div>${escapeHtml(p.name)}${you} · ${p.carrying}/${capacity}${deaths}${down}${talk}</div>`;
     });
     if (html !== this.teamListHtml) {
       this.teamListHtml = html;
@@ -498,10 +718,12 @@ export class Game {
       + `${grabbedEver ? "✓" : "1."} GRAB loot — walk over it, press E</div>`;
     obj += `<div class="${banked >= quota && quota > 0 ? "done" : "todo"}">`
       + `${banked >= quota && quota > 0 ? "✓" : "2."} BANK it in the EXTRACT zone `
-      + `(green light) · ${banked}/${quota}</div>`;
+      + `(green light) · ${banked}/${quota} value</div>`;
     if (!st.keycardTaken) {
       obj += `<div class="hintline">◆ grab the SECURITY CARD to open the ARCHIVES</div>`;
     }
+    obj += `<div class="hintline">◆ ${IS_TOUCH ? "DUCK" : "hold CTRL"} to move quietly · `
+      + `shut a door behind you</div>`;
     obj += `<div class="warn">☠ don't get caught — you drop your haul</div>`;
     if (obj !== this.objectivesHtml) {
       this.objectivesHtml = obj;
@@ -516,32 +738,76 @@ export class Game {
     fill.style.width = `${Math.round(stam * 100)}%`;
     fill.classList.toggle("locked", this.controller.staminaLocked);
 
-    // interact prompt: keycard > breaker > loot
+    // noise meter: how far the monster can hear you right now
+    const noise = self?.noise ?? this.controller.noise;
+    const noiseFill = document.getElementById("noiseFill")!;
+    noiseFill.style.width = `${Math.round((noise / NOISE_SPRINT) * 100)}%`;
+    noiseFill.classList.toggle("walk", noise > NOISE_CROUCH && noise <= NOISE_WALK);
+    noiseFill.classList.toggle("loud", noise > NOISE_WALK);
+    const noiseLabel =
+      noise > NOISE_WALK ? "LOUD" : noise > NOISE_CROUCH ? "AUDIBLE" : "QUIET";
+    const labelEl = document.getElementById("noiseLabel")!;
+    if (labelEl.textContent !== noiseLabel) labelEl.textContent = noiseLabel;
+
+    // downed overlay
+    const downed = !!self?.downed;
+    document.getElementById("downed")!.classList.toggle("hidden", !downed);
+    if (downed) {
+      const bleed = Math.max(0, self.bleed ?? 0);
+      document.getElementById("bleedFill")!.style.width =
+        `${Math.round((bleed / BLEED_OUT_SECONDS) * 100)}%`;
+      const rp = self.reviveProgress ?? 0;
+      document.getElementById("reviveWrap")!.classList.toggle("hidden", rp <= 0.01);
+      document.getElementById("reviveFill")!.style.width = `${Math.round(rp * 100)}%`;
+      document.getElementById("downedSub")!.textContent =
+        this.remotes.count > 0
+          ? `someone has to come for you · ${Math.ceil(bleed)}s`
+          : `nobody is coming · ${Math.ceil(bleed)}s`;
+    }
+
+    // interact prompt — same source of truth as the keypress
     const prompt = document.getElementById("grabPrompt")!;
-    let promptText: string | null = null;
-    if (active && self) {
-      const { keycardPos, breakerPos } = this.layout;
-      if (
-        !st.keycardTaken &&
-        Math.hypot(keycardPos.x - self.x, keycardPos.z - self.z) <= INTERACT_RADIUS
-      ) {
-        promptText = "TAKE SECURITY CARD";
-      } else if (
-        !st.shortcutOpen &&
-        Math.hypot(breakerPos.x - self.x, breakerPos.z - self.z) <= INTERACT_RADIUS
-      ) {
-        promptText = "REROUTE POWER";
-      } else {
-        const near = this.lootView.nearestGround(st.loot, self.x, self.z);
-        if (near.dist <= PICKUP_RADIUS && self.carrying < CARRY_CAPACITY) {
-          promptText = `GRAB ${near.label}`;
-        }
-      }
+    let promptText = target?.label ?? null;
+    // an empty flashlight with a spare on your belt is worth shouting about
+    if (!promptText && active && !downed && battery <= 0 && cells > 0) {
+      promptText = "[R] LOAD A FRESH CELL";
     }
     prompt.classList.toggle("hidden", promptText === null);
     if (promptText !== null) {
       document.getElementById("grabLabel")!.textContent = promptText;
     }
+
+    if (!active) this.renderShop(st);
+  }
+
+  /** Between-shift requisitions. Re-renders only when something changed. */
+  private renderShop(st: any) {
+    const credits = st.credits ?? 0;
+    let html = "";
+    for (const u of UPGRADES) {
+      const level = st.upgrades.get(u.id) ?? 0;
+      const cost = upgradeCost(u.id, level);
+      const pips = "▮".repeat(level) + "▯".repeat(u.costs.length - level);
+      const maxed = cost === null;
+      const afford = !maxed && cost <= credits;
+      html +=
+        `<div class="item${maxed ? " maxed" : ""}">` +
+        `<span class="pips">${pips}</span>` +
+        `<span class="name">${u.label} <span class="blurb">${u.blurb}</span></span>` +
+        `<button data-buy="${u.id}"${maxed || !afford ? " disabled" : ""}>` +
+        `${maxed ? "MAX" : `${cost} CR`}</button></div>`;
+    }
+    if (html === this.shopHtml) return;
+    this.shopHtml = html;
+    document.getElementById("creditsVal")!.textContent = `${credits} CR`;
+    const el = document.getElementById("shop")!;
+    el.innerHTML = html;
+    el.querySelectorAll<HTMLButtonElement>("button[data-buy]").forEach((b) => {
+      b.addEventListener("click", () => {
+        this.room.send(MSG.Buy, { id: b.dataset.buy });
+        this.audio.sting("buy");
+      });
+    });
   }
 
   private toast(text: string) {
@@ -559,7 +825,7 @@ export class Game {
     title.classList.toggle("loss", !st.win);
     document.getElementById("resultsSub")!.textContent = st.win
       ? `quota met. shift ${shift + 1} will want more of you.`
-      : `the clock ran out. shift ${shift} again — the building is patient.`;
+      : `the clock ran out. shift ${shift} again — a different floor plan this time.`;
     // a cleared shift moves you forward; a failed one is retried in place
     document.getElementById("againBtn")!.textContent = st.win
       ? "NEXT SHIFT"
@@ -567,7 +833,7 @@ export class Game {
 
     const players: any[] = [];
     st.players.forEach((p: any) => players.push(p));
-    players.sort((a, b) => b.extractedCount - a.extractedCount);
+    players.sort((a, b) => b.extractedValue - a.extractedValue);
 
     let rows = "";
     for (const p of players) {
@@ -576,11 +842,14 @@ export class Game {
           ? `<span class="fate dead">✕ caught ×${p.deaths}</span>`
           : `<span class="fate">clean</span>`;
       rows += `<div class="row"><span>${escapeHtml(p.name)}</span>` +
-        `<span>${p.extractedCount} extracted</span>${fate}</div>`;
+        `<span>${p.extractedValue} value · ${p.extractedCount} items</span>${fate}</div>`;
     }
     rows += `<div class="row total"><span>TEAM</span>` +
-      `<span>${st.extractedTotal}/${st.quota} extracted</span><span></span></div>`;
+      `<span>${st.extractedTotal}/${st.quota} banked</span><span></span></div>`;
     document.getElementById("resultsRows")!.innerHTML = rows;
+    // force a shop repaint: credits just changed
+    this.shopHtml = "";
+    this.renderShop(st);
     document.getElementById("results")!.classList.remove("hidden");
   }
 

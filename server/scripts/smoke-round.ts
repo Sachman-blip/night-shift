@@ -20,7 +20,7 @@ import {
   type TeleportMessage,
 } from "../../shared/messages";
 import { buildLayout, IDENTITY_LAYOUT, LOOT_COUNT } from "../../shared/map";
-import { CARRY_CAPACITY } from "../../shared/loot";
+import { CARRY_CAPACITY, lootValue } from "../../shared/loot";
 
 const L = buildLayout(IDENTITY_LAYOUT);
 const SPAWN_POINTS = L.spawnPoints;
@@ -174,8 +174,12 @@ async function main() {
   // ---- 3. extraction -> win ----
   console.log("[3] extraction banks loot and wins at quota");
   {
+    // Quota is a VALUE target now, so the win depends on WHAT was grabbed:
+    // sum the two items' worth and expect exactly that much banked.
+    let expectedValue = 0;
     for (let i = 0; i < 2; i++) {
       const [id, l] = groundLootByDistance(room)[0];
+      expectedValue += lootValue(l.kind);
       await pickupOne(room, id, l);
     }
     assert(me(room).carrying === 2, "carrying 2 for extraction");
@@ -187,7 +191,15 @@ async function main() {
     const m = me(room);
     assert(m.extractedCount === 2, "extractedCount = 2 for me");
     assert(m.carrying === 0, "carrying emptied by banking");
-    assert(s.extractedTotal === 2, "team extractedTotal = 2");
+    assert(
+      s.extractedTotal === expectedValue,
+      `team banked the two items' value (${s.extractedTotal} === ${expectedValue})`
+    );
+    assert(
+      m.extractedValue === expectedValue,
+      `my extractedValue === ${expectedValue}`
+    );
+    assert(s.credits > 0, `clearing the shift paid credits (${s.credits})`);
 
     // enemy must be frozen during results
     const e1 = s.enemies.e0;

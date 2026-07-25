@@ -36,6 +36,11 @@ export interface Flicker {
 
 export interface BuiltMap {
   flickers: Flicker[];
+  /** Everything added to the scene, so a new shift can tear it all down. */
+  objects: THREE.Object3D[];
+  bodies: RAPIER.RigidBody[];
+  geometries: THREE.BufferGeometry[];
+  materials: THREE.Material[];
 }
 
 const DEFAULT_LIGHT = 0xcfe8c4;
@@ -51,6 +56,10 @@ export function buildMap(
   // ~450 draw calls (x2 with the flashlight's shadow pass), so merge into
   // one mesh per color. Colliders stay per-box; deco boxes get none.
   const byColor = new Map<number, THREE.BufferGeometry[]>();
+  const objects: THREE.Object3D[] = [];
+  const bodies: RAPIER.RigidBody[] = [];
+  const geometries: THREE.BufferGeometry[] = [];
+  const materials: THREE.Material[] = [];
 
   for (const b of boxes) {
     const geo = new THREE.BoxGeometry(b.sx, b.sy, b.sz);
@@ -70,6 +79,7 @@ export function buildMap(
         R.ColliderDesc.cuboid(b.sx / 2, b.sy / 2, b.sz / 2),
         body
       );
+      bodies.push(body);
     }
   }
 
@@ -77,54 +87,80 @@ export function buildMap(
     const merged = mergeGeometries(geos);
     for (const g of geos) g.dispose();
     const s = SURFACE[color] ?? { rough: 0.9, metal: 0 };
-    const mesh = new THREE.Mesh(
-      merged,
-      new THREE.MeshStandardMaterial({
-        color,
-        roughness: s.rough,
-        metalness: s.metal,
-        emissive: s.emissive ?? 0x000000,
-        emissiveIntensity: s.ei ?? 1,
-      })
-    );
+    const material = new THREE.MeshStandardMaterial({
+      color,
+      roughness: s.rough,
+      metalness: s.metal,
+      emissive: s.emissive ?? 0x000000,
+      emissiveIntensity: s.ei ?? 1,
+    });
+    const mesh = new THREE.Mesh(merged, material);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
     scene.add(mesh);
+    objects.push(mesh);
+    geometries.push(merged);
+    materials.push(material);
   }
 
   // Ceiling fixtures. "off" ones still get a dead tube mesh so rooms
   // read as abandoned rather than unfinished. Tint varies per zone.
   const tubeGeo = new THREE.BoxGeometry(1.4, 0.1, 0.4);
   const offMat = new THREE.MeshLambertMaterial({ color: 0x23261f });
+  geometries.push(tubeGeo);
+  materials.push(offMat);
   const flickers: Flicker[] = [];
 
   for (const def of lightPoints) {
     const on = def.mode !== "off";
     const tint = def.color ?? DEFAULT_LIGHT;
-    const tube = new THREE.Mesh(
-      tubeGeo,
-      on
-        ? new THREE.MeshLambertMaterial({
-            color: 0x333833,
-            emissive: tint,
-            emissiveIntensity: 0.9,
-          })
-        : offMat
-    );
+    let tubeMat: THREE.Material = offMat;
+    if (on) {
+      tubeMat = new THREE.MeshLambertMaterial({
+        color: 0x333833,
+        emissive: tint,
+        emissiveIntensity: 0.9,
+      });
+      materials.push(tubeMat);
+    }
+    const tube = new THREE.Mesh(tubeGeo, tubeMat);
     tube.position.set(def.x, WALL_HEIGHT - 0.06, def.z);
     scene.add(tube);
+    objects.push(tube);
     if (!on) continue;
 
     const light = new THREE.PointLight(tint, 14, 13, 2);
     light.position.set(def.x, WALL_HEIGHT - 0.25, def.z);
     scene.add(light);
+    objects.push(light);
 
     if (def.mode === "flicker") {
       flickers.push({ light, tube, baseIntensity: 14, timer: 0 });
     }
   }
 
-  return { flickers };
+  return { flickers, objects, bodies, geometries, materials };
+}
+
+/**
+ * Tear down a built map: a new shift re-rolls the layout, so every mesh,
+ * collider and light from the previous arrangement has to go. Rapier bodies
+ * take their colliders with them.
+ */
+export function disposeMap(
+  scene: THREE.Scene,
+  world: RAPIER.World,
+  built: BuiltMap
+) {
+  for (const o of built.objects) scene.remove(o);
+  for (const b of built.bodies) world.removeRigidBody(b);
+  for (const g of built.geometries) g.dispose();
+  for (const m of built.materials) m.dispose();
+  built.objects = [];
+  built.bodies = [];
+  built.geometries = [];
+  built.materials = [];
+  built.flickers = [];
 }
 
 export function updateFlickers(flickers: Flicker[], dt: number) {

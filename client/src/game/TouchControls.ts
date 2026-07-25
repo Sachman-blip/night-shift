@@ -44,6 +44,25 @@ export class TouchControls {
     bind("btnGrab", actions.onInteract);
     bind("btnJump", () => this.controller.queueJump());
     bind("btnTorch", () => (this.controller.torch = !this.controller.torch));
+
+    // DUCK is a toggle and shows its state — there is nowhere to hold a
+    // modifier on a phone, and crouching is a stance you stay in.
+    const crouchBtn = document.getElementById("btnCrouch")!;
+    bind("btnCrouch", () => {
+      this.controller.crouching = !this.controller.crouching;
+      crouchBtn.classList.toggle("on", this.controller.crouching);
+    });
+
+    // GRAB doubles as the revive hold, so track press AND release.
+    const grabBtn = document.getElementById("btnGrab")!;
+    grabBtn.addEventListener(
+      "touchstart",
+      () => (this.controller.touchInteract = true),
+      { passive: false }
+    );
+    for (const ev of ["touchend", "touchcancel"]) {
+      grabBtn.addEventListener(ev, () => (this.controller.touchInteract = false));
+    }
   }
 
   private uiTarget(e: TouchEvent): boolean {

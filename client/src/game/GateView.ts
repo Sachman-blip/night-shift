@@ -19,6 +19,8 @@ export class GateView {
   private doors: GateDoor[] = [];
   private keycard: THREE.Mesh;
   private breakerLamp: THREE.MeshLambertMaterial;
+  /** Everything added to the scene, so a re-rolled layout can clear it. */
+  private owned: THREE.Object3D[] = [];
 
   constructor(
     scene: THREE.Scene,
@@ -37,6 +39,7 @@ export class GateView {
       mesh.castShadow = true;
       mesh.receiveShadow = true;
       scene.add(mesh);
+      this.owned.push(mesh);
 
       const body = world.createRigidBody(
         R.RigidBodyDesc.fixed().setTranslation(d.x, d.y, d.z)
@@ -57,6 +60,7 @@ export class GateView {
     );
     this.keycard.position.set(keycardPos.x, keycardPos.y, keycardPos.z);
     scene.add(this.keycard);
+    this.owned.push(this.keycard);
 
     // breaker box on the maintenance wall, with a status lamp
     const box = new THREE.Mesh(
@@ -65,6 +69,7 @@ export class GateView {
     );
     box.position.set(breakerPos.x, 1.4, breakerPos.z);
     scene.add(box);
+    this.owned.push(box);
     this.breakerLamp = new THREE.MeshLambertMaterial({
       color: 0x442222,
       emissive: 0xcc3322,
@@ -73,6 +78,25 @@ export class GateView {
     const lamp = new THREE.Mesh(new THREE.BoxGeometry(0.05, 0.08, 0.08), this.breakerLamp);
     lamp.position.set(breakerPos.x - 0.1, 1.65, breakerPos.z);
     scene.add(lamp);
+    this.owned.push(lamp);
+  }
+
+  /** Drop every mesh and collider; used when a new shift re-rolls the map. */
+  dispose(scene: THREE.Scene) {
+    for (const d of this.doors) {
+      if (d.collider) this.world.removeCollider(d.collider, true);
+      this.world.removeRigidBody(d.body);
+    }
+    for (const o of this.owned) {
+      scene.remove(o);
+      const mesh = o as THREE.Mesh;
+      mesh.geometry?.dispose();
+      const mat = mesh.material as THREE.Material | THREE.Material[] | undefined;
+      if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+      else mat?.dispose();
+    }
+    this.doors = [];
+    this.owned = [];
   }
 
   /** Called each frame with the raw room state. */

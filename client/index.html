@@ -12,6 +12,7 @@
     <div class="panel">
       <h1>NIGHT&nbsp;SHIFT</h1>
       <p class="sub">the building closes at midnight. you don't.</p>
+      <p class="credit">made by sachman</p>
 
       <label for="nameInput">CALLSIGN</label>
       <input id="nameInput" maxlength="16" placeholder="EMPLOYEE" autocomplete="off" />
@@ -40,23 +41,40 @@
       <div id="timer">--:--</div>
       <div id="lootHud">
         <span id="carryCount">0/3</span> CARRIED &middot;
-        <span id="bankCount">0/5</span> BANKED
+        <span id="bankCount">0/24</span> BANKED
+      </div>
+      <div id="gearHud">
+        <span id="batteryHud">BEAM 100%</span> &middot;
+        <span id="cellsHud">1 CELL</span>
       </div>
     </div>
     <div id="crosshair"></div>
     <div id="grabPrompt" class="hidden">[E] <span id="grabLabel"></span></div>
-    <div id="stamWrap"><div id="stamFill"></div></div>
-    <div id="micHud">MIC…</div>
+    <div id="meters">
+      <div id="stamWrap"><div id="stamFill"></div></div>
+      <div id="noiseWrap"><div id="noiseFill"></div><span id="noiseLabel">QUIET</span></div>
+    </div>
+    <div id="micHud">MIC&hellip;</div>
     <div id="toast"></div>
     <div id="deathFlash">CAUGHT</div>
+    <div id="downed" class="hidden">
+      <div class="dTitle">YOU'RE DOWN</div>
+      <div class="dSub" id="downedSub">someone has to come for you</div>
+      <div class="dBar"><div id="bleedFill"></div></div>
+      <div class="dRevive hidden" id="reviveWrap">
+        <span>BEING PULLED UP</span>
+        <div class="dBar"><div id="reviveFill"></div></div>
+      </div>
+    </div>
     <div id="lockPrompt">click to look around</div>
-    <div id="hint">WASD move &middot; SHIFT run &middot; SPACE jump &middot; F flashlight &middot; E grab &middot; V mic</div>
+    <div id="hint">WASD move &middot; SHIFT run &middot; CTRL/C crouch &middot; SPACE jump &middot; F light &middot; R cell &middot; E interact &middot; V mic</div>
   </div>
 
   <div id="touchUI" class="hidden">
     <div id="stickBase"><div id="stickNub"></div></div>
     <div id="touchButtons">
       <button id="btnGrab">GRAB</button>
+      <button id="btnCrouch">DUCK</button>
       <button id="btnJump">JUMP</button>
       <button id="btnTorch">LIGHT</button>
       <button id="btnMic">MIC</button>
@@ -69,6 +87,13 @@
       <h1 id="resultsTitle">SHIFT COMPLETE</h1>
       <p class="sub" id="resultsSub"></p>
       <div id="resultsRows"></div>
+
+      <div id="shopHead">
+        <span>REQUISITIONS</span>
+        <span id="creditsVal">0 CR</span>
+      </div>
+      <div id="shop"></div>
+
       <button id="againBtn">NEXT SHIFT</button>
     </div>
   </div>

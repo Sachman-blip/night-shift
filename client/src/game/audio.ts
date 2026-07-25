@@ -9,7 +9,9 @@
 //   steps    — noise-burst footsteps, heavier/brighter when sprinting
 //   stingers — pickup / bank / death / win / loss one-shots
 
-type StingKind = "pickup" | "bank" | "death" | "win" | "loss" | "unlock";
+type StingKind =
+  | "pickup" | "bank" | "death" | "win" | "loss" | "unlock"
+  | "door" | "forced" | "revive" | "cell" | "buy";
 
 const ENEMY_AUDIO_RANGE = 25; // silent beyond this distance (m)
 
@@ -140,7 +142,7 @@ export class AudioEngine {
     }
   }
 
-  step(sprinting: boolean) {
+  step(sprinting: boolean, crouching = false) {
     const ctx = this.ctx;
     if (!ctx) return;
     const t = ctx.currentTime;
@@ -149,9 +151,12 @@ export class AudioEngine {
     src.playbackRate.value = 0.9 + Math.random() * 0.25;
     const lp = ctx.createBiquadFilter();
     lp.type = "lowpass";
-    lp.frequency.value = (sprinting ? 700 : 420) * (0.9 + Math.random() * 0.2);
+    // ducked steps are a muffled scuff — your own ears should agree with
+    // the noise meter, otherwise crouching just feels like walking slowly
+    const cutoff = crouching ? 240 : sprinting ? 700 : 420;
+    lp.frequency.value = cutoff * (0.9 + Math.random() * 0.2);
     const g = ctx.createGain();
-    g.gain.setValueAtTime(sprinting ? 0.11 : 0.055, t);
+    g.gain.setValueAtTime(crouching ? 0.022 : sprinting ? 0.11 : 0.055, t);
     g.gain.exponentialRampToValueAtTime(0.0001, t + 0.07);
     src.connect(lp).connect(g).connect(this.master);
     src.start(t);
@@ -200,7 +205,49 @@ export class AudioEngine {
         this.tone(160, "square", t, 0.1, 0.09, 120);
         this.tone(90, "sine", t + 0.06, 0.25, 0.12);
         break;
+      case "door": // a door swinging shut: wooden thud + latch tick
+        this.noiseBurst(t, 0.14, 0.09, 260);
+        this.tone(120, "sine", t, 0.13, 0.1, 74);
+        this.noiseBurst(t + 0.1, 0.05, 0.03, 2600);
+        break;
+      case "forced": {
+        // something tore a door open somewhere: splinter + a falling groan
+        this.noiseBurst(t, 0.3, 0.13, 1500);
+        this.noiseBurst(t + 0.05, 0.4, 0.09, 500);
+        this.tone(190, "sawtooth", t, 0.5, 0.11, 62);
+        break;
+      }
+      case "revive": // pulled back to your feet
+        [392, 523, 659].forEach((f, i) =>
+          this.tone(f, "sine", t + i * 0.11, 0.35, 0.08)
+        );
+        break;
+      case "cell": // fresh battery seated
+        this.noiseBurst(t, 0.05, 0.05, 3200);
+        this.tone(420, "square", t + 0.05, 0.05, 0.05, 620);
+        break;
+      case "buy":
+        this.tone(700, "triangle", t, 0.08, 0.07);
+        this.tone(1050, "triangle", t + 0.08, 0.14, 0.06);
+        break;
     }
+  }
+
+  /** Filtered noise hit — the workhorse for impacts and splintering. */
+  private noiseBurst(t: number, dur: number, vol: number, cutoff: number) {
+    const ctx = this.ctx!;
+    const src = ctx.createBufferSource();
+    src.buffer = this.noiseBuf;
+    src.playbackRate.value = 0.8 + Math.random() * 0.4;
+    const lp = ctx.createBiquadFilter();
+    lp.type = "lowpass";
+    lp.frequency.value = cutoff;
+    const g = ctx.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(lp).connect(g).connect(this.master);
+    src.start(t);
+    src.stop(t + dur + 0.05);
   }
 
   /**

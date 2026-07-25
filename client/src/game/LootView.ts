@@ -1,5 +1,5 @@
 import * as THREE from "three";
-import { LOOT_TYPES } from "../../../shared/loot";
+import { LOOT_TYPES, lootValue } from "../../../shared/loot";
 
 interface LootItem {
   mesh: THREE.Object3D;
@@ -24,6 +24,8 @@ export class LootView {
   private zoneLight: THREE.PointLight;
   private sign: THREE.Sprite;
   private signBaseY = 2.85;
+  /** Beacon parts, tracked so a re-rolled layout can move the whole thing. */
+  private beacon: THREE.Object3D[] = [];
 
   constructor(
     private scene: THREE.Scene,
@@ -44,6 +46,7 @@ export class LootView {
     quad.rotation.x = -Math.PI / 2;
     quad.position.set(zone.x, 0.02, zone.z);
     scene.add(quad);
+    this.beacon.push(quad);
 
     // floor-to-ceiling light column (two nested translucent cylinders)
     for (const [radius, opacity] of [[0.45, 0.22], [1.0, 0.09]] as const) {
@@ -62,6 +65,7 @@ export class LootView {
       );
       pillar.position.set(zone.x, 1.6, zone.z);
       scene.add(pillar);
+      this.beacon.push(pillar);
       this.pillarMats.push(mat);
     }
 
@@ -70,11 +74,29 @@ export class LootView {
     this.sign = this.makeSign();
     this.sign.position.set(zone.x, this.signBaseY, zone.z);
     scene.add(this.sign);
+    this.beacon.push(this.sign);
 
     // cyan spill on the surrounding walls/floor
     this.zoneLight = new THREE.PointLight(ZONE_COLOR, 8, 12, 2);
     this.zoneLight.position.set(zone.x, 2.4, zone.z);
     scene.add(this.zoneLight);
+    this.beacon.push(this.zoneLight);
+  }
+
+  /** Drop the beacon and every loot model (a new shift re-rolls the map). */
+  dispose() {
+    for (const o of [...this.beacon, ...[...this.items.values()].map((i) => i.mesh)]) {
+      this.scene.remove(o);
+      o.traverse((child) => {
+        const mesh = child as THREE.Mesh;
+        mesh.geometry?.dispose();
+        const mat = mesh.material as THREE.Material | THREE.Material[] | undefined;
+        if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+        else mat?.dispose();
+      });
+    }
+    this.beacon = [];
+    this.items.clear();
   }
 
   private makeSign(): THREE.Sprite {
@@ -251,17 +273,21 @@ export class LootView {
   }
 
   /** Nearest ground loot to a point, for the grab prompt. */
-  nearestGround(loot: any, x: number, z: number): { dist: number; label: string } {
+  nearestGround(
+    loot: any, x: number, z: number
+  ): { dist: number; label: string; value: number } {
     let dist = Infinity;
     let label = "";
+    let value = 0;
     loot.forEach((l: any) => {
       if (l.carrier !== "" || l.extracted) return;
       const d = Math.hypot(l.x - x, l.z - z);
       if (d < dist) {
         dist = d;
         label = LOOT_TYPES[l.kind]?.label ?? "LOOT";
+        value = lootValue(l.kind);
       }
     });
-    return { dist, label };
+    return { dist, label, value };
   }
 }

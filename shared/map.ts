@@ -29,6 +29,23 @@ export interface GateDoorDef {
   color: number;
 }
 
+/**
+ * A plain door anyone can swing shut. Unlike a gate these are not locked and
+ * not part of the objective — they are a tool: closed, they stop the monster
+ * dead for a couple of seconds and cut its line of sight. They live in the
+ * fixed skeleton, so index N means the same doorway in every layout, and
+ * their open/closed bits sync as a flat boolean array.
+ */
+export interface DoorDef {
+  x: number; y: number; z: number;
+  sx: number; sy: number; sz: number;
+  /** Panel spans X (it fills a gap in a wall running along X). */
+  alongX: boolean;
+  /** Which end of the panel the hinge sits on (-1 = low coord, 1 = high). */
+  hinge: -1 | 1;
+  color: number;
+}
+
 export type LightMode = "on" | "flicker" | "off";
 export interface LightDef { x: number; z: number; mode: LightMode; color?: number }
 
@@ -49,6 +66,7 @@ export interface LayoutDescriptor {
 export interface Layout {
   boxes: BoxDef[];
   gateDoors: GateDoorDef[];
+  doors: DoorDef[];
   lights: LightDef[];
   navNodes: Record<string, NavNode>;
   navEdges: NavEdge[];
@@ -109,6 +127,21 @@ const wallZ = (x: number, z1: number, z2: number) =>
   box(x, H / 2, (z1 + z2) / 2, T, H, z2 - z1, COLORS.wall);
 const lintel = (x: number, z: number, alongX: boolean, width = 1.6) =>
   box(x, 2.7, z, alongX ? width : T, H - 2.2, alongX ? T : width, COLORS.wall);
+
+/**
+ * Hang a swinging door in a lintel'd gap. The panel is deliberately NOT a
+ * static box: like the gates it is dynamic geometry, so it stays out of the
+ * LOS blocker set and out of nav validation, and is fed in as an extra rect
+ * only while it is actually shut.
+ */
+const door = (x: number, z: number, alongX: boolean, width: number, hinge: -1 | 1) =>
+  cur.doors.push({
+    x: x + curDX, y: 1.1, z,
+    sx: alongX ? width : 0.1,
+    sy: 2.2,
+    sz: alongX ? 0.1 : width,
+    alongX, hinge, color: COLORS.door,
+  });
 
 const light = (x: number, z: number, mode: LightMode, color?: number) =>
   cur.lights.push({ x: x + curDX, z, mode, color });
@@ -527,6 +560,24 @@ function buildSkeleton() {
   papers(35, 12.2, 3);
   box(40, 0.12, 0, 1.6, 0.24, 1.2, COLORS.crate);
 
+  // Swinging doors, in a fixed order so index N is the same doorway in every
+  // layout. Deliberately NOT hung in the two east-corridor gaps at x=22/33,
+  // z=1.5 and z=10 — those are where the archives gate panels land.
+  door(-12, -1.5, true, 1.6, -1);  // 0  north slot 0
+  door(0, -1.5, true, 1.6, 1);     // 1  north slot 1
+  door(12, -1.5, true, 1.6, -1);   // 2  north slot 2
+  door(-9, 1.5, true, 1.6, 1);     // 3  south slot 0
+  door(9, 1.5, true, 1.6, -1);     // 4  south slot 1
+  door(22, -1.5, true, 1.6, -1);   // 5  cubicle floor, west entry
+  door(30, -1.5, true, 1.6, 1);    // 6  cubicle floor, east entry
+  door(36, -1.5, true, 1.6, -1);   // 7  print room
+  door(34, -12, false, 1.6, -1);   // 8  cubicle floor <-> conference
+  door(38, -8, true, 1.6, 1);      // 9  conference <-> print
+  door(40, 3, true, 1.6, -1);      // 10 loading dock <-> south hall
+  door(22, 13, true, 1.4, -1);     // 11 closet slot 0
+  door(30, 13, true, 1.4, 1);      // 12 closet slot 1
+  door(38, 13, true, 1.4, -1);     // 13 closet slot 2
+
   // fixed lights
   light(-12, 0, "on"); light(0, 0, "flicker"); light(12, 0, "off");
   light(22, 0, "on"); light(30, 0, "off"); light(36, 0, "flicker");
@@ -582,7 +633,7 @@ const dedupPush = (route: string[], id: string) => {
 
 export function buildLayout(desc: LayoutDescriptor): Layout {
   cur = {
-    boxes: [], gateDoors: [], lights: [], navNodes: {}, navEdges: [],
+    boxes: [], gateDoors: [], doors: [], lights: [], navNodes: {}, navEdges: [],
     patrolRoute: [], spawnPoints: [], enemySpawn: { x: 0, z: 0 },
     extractionZone: { x: 40, z: 0, sx: 3.4, sz: 3.4 },
     keycardPos: { x: 0, z: 0, y: 0.85 }, breakerPos: { x: 0, z: 0 },

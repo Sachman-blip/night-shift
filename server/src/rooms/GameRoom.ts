@@ -4,8 +4,11 @@ import {
   EnemyAI,
   ENEMY_VARIANTS,
   type EnemyVariant,
+  type EnemyWorld,
+  type DoorBlocker,
   type TrackedPlayer,
 } from "../ai/EnemyAI";
+import { toRect, type Rect } from "../ai/los";
 import { generateLayout, type GeneratedLayout } from "../layout";
 import {
   MSG,
@@ -18,9 +21,24 @@ import {
   STAMINA_REGEN_PER_S,
   STAMINA_MIN_SPRINT,
   SPRINT_DETECT_SPEED,
+  CROUCH_DETECT_SPEED,
+  NOISE_IDLE,
+  noiseForSpeed,
+  BATTERY_DRAIN_PER_S,
+  BASE_CELLS,
+  REVIVE_RADIUS,
+  REVIVE_SECONDS,
+  REVIVE_DECAY_PER_S,
+  REVIVE_INVULN_MS,
+  BLEED_OUT_SECONDS,
+  BLEED_TIME_PENALTY,
+  DOOR_INTERACT_RADIUS,
+  DOOR_BLOCK_RADIUS,
   type MoveMessage,
   type DeathMessage,
   type TeleportMessage,
+  type ForcedMessage,
+  type BuyMessage,
 } from "../../../shared/messages";
 import {
   MAP_BOUNDS,
@@ -30,12 +48,17 @@ import {
 } from "../../../shared/map";
 import {
   LOOT_GROUND_Y,
-  CARRY_CAPACITY,
   PICKUP_RADIUS,
   SOLO_MODE,
   MULTI_MODE,
   MAX_ENEMIES,
   planShift,
+  lootValue,
+  creditsEarned,
+  upgradeCost,
+  carryCapacityFor,
+  noiseScaleFor,
+  staminaDrainScaleFor,
 } from "../../../shared/loot";
 import { pickLoot } from "../layout";
 import type { LootCandidate } from "../../../shared/map";
@@ -58,6 +81,10 @@ const SAFE_SPAWN_RADIUS = 16;
 // Post-scatter, a monster lands at least this far from every player and the
 // kill site (also > max vision, so it can't just turn around and re-acquire).
 const SCATTER_MIN_DIST = 15;
+/** Ignore door toggles this soon after the last one (one swing per press). */
+const DOOR_COOLDOWN_MS = 400;
+/** Revive progress decays once the rescuer has been silent this long. */
+const REVIVE_STALE_MS = 400;
 
 const DROP_SCATTER: [number, number][] = [
   [0.6, 0], [-0.45, 0.45], [0, -0.6], [0.45, 0.45],
@@ -75,6 +102,11 @@ interface PlayerMeta {
   lastMoveAt: number;
   staminaLocked: boolean;
   moveBudget: number;
+  doorCooldownUntil: number;
+  /** When this player last pushed revive progress into somebody. */
+  lastReviveAt: number;
+  /** When somebody last fed revive progress into THIS player. */
+  reviveFedAt: number;
 }
 
 interface CreateOptions {
@@ -85,7 +117,7 @@ interface CreateOptions {
   noEnemy?: boolean;
   /** Test/debug: skip the speed clamp so test harnesses can teleport. */
   freeMove?: boolean;
-  /** Test/debug: pin the exact map arrangement. */
+  /** Test/debug: pin the exact map arrangement (also disables re-rolling). */
   layout?: LayoutDescriptor;
   /** Test/debug: pin the monster type (normally rolled per round). */
   variant?: EnemyVariant;
@@ -108,25 +140,31 @@ export class GameRoom extends Room<GameState> {
   private enemyEnabled = true;
   private freeMove = false;
   private pinnedVariant?: EnemyVariant;
+  private pinnedLayout?: LayoutDescriptor;
   private baseEnemies = 2;
   private enemiesPinned = false;
+  /** Door panels as 2D rects, index-aligned with the layout's door list. */
+  private doorRects: Rect[] = [];
+  /** Rebuilt whenever a door toggles; read by every AI each tick. */
+  private closedDoors: DoorBlocker[] = [];
 
   async onCreate(options: CreateOptions = {}) {
     this.setPatchRate(PATCH_RATE_MS);
     this.roomId = await this.generateRoomCode();
 
-    // assemble + validate this room's map arrangement
-    this.gen = generateLayout(options.layout);
-    this.state.layout = JSON.stringify(this.gen.descriptor);
-
     // 0 = "use per-mode defaults, decided at each round start"
     this.optSeconds = clamp(Math.floor(Number(options.roundSeconds)) || 0, 0, 1800);
-    this.optQuota = clamp(Math.floor(Number(options.quota)) || 0, 0, 50);
+    this.optQuota = clamp(Math.floor(Number(options.quota)) || 0, 0, 400);
     this.enemyEnabled = !options.noEnemy;
     this.freeMove = !!options.freeMove;
+    this.pinnedLayout = options.layout;
     if (options.variant && options.variant in ENEMY_VARIANTS) {
       this.pinnedVariant = options.variant;
     }
+
+    // assemble + validate this room's first map arrangement
+    this.gen = generateLayout(this.pinnedLayout);
+    this.state.layout = JSON.stringify(this.gen.descriptor);
 
     // A pinned enemy count (tests) holds fixed; otherwise it's the shift-1
     // baseline that escalation grows from. Monsters share the patrol route
@@ -140,13 +178,15 @@ export class GameRoom extends Room<GameState> {
     this.onMessage(MSG.Move, (client, msg: MoveMessage) => {
       if (this.state.phase !== "active") return;
       const p = this.state.players.get(client.sessionId);
-      if (!p || typeof msg !== "object" || msg === null) return;
+      // on the floor you don't move: position is frozen where you fell
+      if (!p || p.downed || typeof msg !== "object" || msg === null) return;
 
       const m = this.meta.get(client.sessionId);
       if (m && m.ignoreMovesUntil > Date.now()) return;
 
       const { x, y, z, yaw, pitch, torch } = msg;
       if (![x, y, z, yaw, pitch].every(Number.isFinite)) return;
+      const wantsCrouch = !!msg.crouch;
 
       // Movement is client-authoritative (co-op, no PvP) but SPEED is not:
       // stamina is simulated from observed 2D speed, and a token-bucket
@@ -161,13 +201,23 @@ export class GameRoom extends Room<GameState> {
         const dist = Math.hypot(dx, dz);
         const speed = dist / dt;
 
+        const drain =
+          STAMINA_DRAIN_PER_S * staminaDrainScaleFor(this.upgradeLevel("lungs"));
         if (speed > SPRINT_DETECT_SPEED) {
-          p.stamina = Math.max(0, p.stamina - STAMINA_DRAIN_PER_S * dt);
+          p.stamina = Math.max(0, p.stamina - drain * dt);
           if (p.stamina <= 0) m.staminaLocked = true;
         } else {
           p.stamina = Math.min(1, p.stamina + STAMINA_REGEN_PER_S * dt);
           if (p.stamina >= STAMINA_MIN_SPRINT) m.staminaLocked = false;
         }
+
+        // Noise comes from the speed we OBSERVE, never from the flag the
+        // client sent: claiming to crouch while moving at sprint pace picks
+        // the loud tier anyway, so there is nothing to gain by lying.
+        p.crouching = wantsCrouch && speed <= CROUCH_DETECT_SPEED;
+        p.noise =
+          noiseForSpeed(speed, wantsCrouch) *
+          noiseScaleFor(this.upgradeLevel("boots"));
 
         if (!this.freeMove) {
           const maxSpeed = m.staminaLocked ? WALK_SPEED : SPRINT_SPEED;
@@ -190,13 +240,14 @@ export class GameRoom extends Room<GameState> {
       p.z = nz;
       p.yaw = yaw;
       p.pitch = clamp(pitch, -1.6, 1.6);
-      p.torch = !!torch;
+      // a dead cell means a dead beam, whatever the client believes
+      p.torch = !!torch && p.battery > 0;
     });
 
     this.onMessage(MSG.Pickup, (client) => {
       if (this.state.phase !== "active") return;
       const p = this.state.players.get(client.sessionId);
-      if (!p) return;
+      if (!p || p.downed) return;
 
       const { keycardPos, breakerPos } = this.gen.layout;
       if (
@@ -217,7 +268,7 @@ export class GameRoom extends Room<GameState> {
         return;
       }
 
-      if (p.carrying >= CARRY_CAPACITY) return;
+      if (p.carrying >= this.carryCapacity()) return;
       let best: Loot | null = null;
       let bestD = PICKUP_RADIUS;
       this.state.loot.forEach((l) => {
@@ -234,6 +285,34 @@ export class GameRoom extends Room<GameState> {
       }
     });
 
+    this.onMessage(MSG.Door, (client) => this.toggleDoor(client.sessionId));
+    this.onMessage(MSG.Revive, (client) => this.feedRevive(client.sessionId));
+
+    this.onMessage(MSG.Swap, (client) => {
+      if (this.state.phase !== "active") return;
+      const p = this.state.players.get(client.sessionId);
+      if (!p || p.downed || p.cells <= 0 || p.battery > 0.98) return;
+      p.cells--;
+      p.battery = 1;
+    });
+
+    this.onMessage(MSG.Buy, (client, msg: BuyMessage) => {
+      // the shop is only open between shifts
+      if (this.state.phase !== "ended") return;
+      if (!msg || typeof msg.id !== "string") return;
+      const level = this.upgradeLevel(msg.id);
+      const cost = upgradeCost(msg.id, level);
+      if (cost === null || cost > this.state.credits) return;
+      this.state.credits -= cost;
+      this.state.upgrades.set(msg.id, level + 1);
+      // cells are gear rather than a stat — hand them out on the spot
+      if (msg.id === "cells") {
+        this.state.players.forEach((p) => (p.cells = this.cellsPerPlayer()));
+      }
+      const who = this.state.players.get(client.sessionId)?.name ?? client.sessionId;
+      console.log(`[room ${this.roomId}] ${who} bought ${msg.id} lv${level + 1} (-${cost})`);
+    });
+
     // WebRTC signaling relay: opaque payloads between peers in this room.
     // The server never inspects SDP/ICE — it only validates the target.
     this.onMessage(MSG.Rtc, (client, msg: { to?: string; data?: unknown }) => {
@@ -247,7 +326,9 @@ export class GameRoom extends Room<GameState> {
         // clearing a shift advances to the next, harder one; failing repeats it
         if (this.state.win) this.state.shift++;
         console.log(`[room ${this.roomId}] shift ${this.state.shift}`);
-        this.resetRound();
+        // every shift is a different arrangement of the building — the point
+        // of the chunk system was never to show the same map twice
+        this.resetRound(true);
       }
     });
 
@@ -257,9 +338,150 @@ export class GameRoom extends Room<GameState> {
     );
   }
 
+  // ---------- upgrades ----------
+
+  private upgradeLevel(id: string): number {
+    return this.state.upgrades.get(id) ?? 0;
+  }
+
+  private carryCapacity(): number {
+    return carryCapacityFor(this.upgradeLevel("capacity"));
+  }
+
+  private cellsPerPlayer(): number {
+    return BASE_CELLS + this.upgradeLevel("cells");
+  }
+
+  // ---------- doors ----------
+
+  private resetDoors() {
+    const defs = this.gen.layout.doors;
+    this.doorRects = defs.map(toRect);
+    this.state.doors.clear();
+    // every shift starts with the building open; shutting one is a choice
+    for (let i = 0; i < defs.length; i++) this.state.doors.push(true);
+    this.refreshClosedDoors();
+  }
+
+  private refreshClosedDoors() {
+    this.closedDoors = [];
+    for (let i = 0; i < this.doorRects.length; i++) {
+      if (!this.state.doors[i]) {
+        this.closedDoors.push({ index: i, rect: this.doorRects[i] });
+      }
+    }
+  }
+
+  /** A monster finished tearing at a door: it swings open, loudly. */
+  private forceDoor(index: number) {
+    if (this.state.doors[index] !== false) return;
+    this.state.doors[index] = true;
+    this.refreshClosedDoors();
+    const d = this.gen.layout.doors[index];
+    const msg: ForcedMessage = { index, x: d.x, z: d.z };
+    this.broadcast(MSG.Forced, msg);
+  }
+
+  private toggleDoor(sessionId: string) {
+    if (this.state.phase !== "active") return;
+    const p = this.state.players.get(sessionId);
+    const m = this.meta.get(sessionId);
+    if (!p || !m || p.downed) return;
+    const now = Date.now();
+    if (m.doorCooldownUntil > now) return;
+
+    const defs = this.gen.layout.doors;
+    let best = -1;
+    let bestD = DOOR_INTERACT_RADIUS;
+    for (let i = 0; i < defs.length; i++) {
+      const d = Math.hypot(defs[i].x - p.x, defs[i].z - p.z);
+      if (d < bestD) {
+        bestD = d;
+        best = i;
+      }
+    }
+    if (best < 0) return;
+
+    if (this.state.doors[best]) {
+      // never shut a door on somebody standing in the frame
+      const d = defs[best];
+      let occupied = false;
+      this.state.players.forEach((q) => {
+        if (Math.hypot(d.x - q.x, d.z - q.z) < DOOR_BLOCK_RADIUS) occupied = true;
+      });
+      if (occupied) return;
+    }
+    this.state.doors[best] = !this.state.doors[best];
+    this.refreshClosedDoors();
+    m.doorCooldownUntil = now + DOOR_COOLDOWN_MS;
+  }
+
+  // ---------- downed & revive ----------
+
+  /** Is anybody left standing who could pick this player up? */
+  private hasRescuer(sessionId: string): boolean {
+    let found = false;
+    this.state.players.forEach((q, id) => {
+      if (id !== sessionId && !q.downed) found = true;
+    });
+    return found;
+  }
+
+  private feedRevive(sessionId: string) {
+    if (this.state.phase !== "active") return;
+    const rescuer = this.state.players.get(sessionId);
+    const rm = this.meta.get(sessionId);
+    if (!rescuer || !rm || rescuer.downed) return;
+
+    let targetId: string | null = null;
+    let target: Player | null = null;
+    let bestD = REVIVE_RADIUS;
+    this.state.players.forEach((q, id) => {
+      if (id === sessionId || !q.downed) return;
+      const d = Math.hypot(q.x - rescuer.x, q.z - rescuer.z);
+      if (d <= bestD) {
+        bestD = d;
+        targetId = id;
+        target = q;
+      }
+    });
+    if (!targetId || !target) return;
+
+    // Credit real elapsed time rather than one tick per message, so the
+    // revive takes REVIVE_SECONDS regardless of how fast a client sends.
+    const now = Date.now();
+    const dt = Math.min(Math.max((now - rm.lastReviveAt) / 1000, 0), 0.25);
+    rm.lastReviveAt = now;
+
+    const tm = this.meta.get(targetId);
+    if (tm) tm.reviveFedAt = now;
+    const p = target as Player;
+    p.reviveProgress = Math.min(1, p.reviveProgress + dt / REVIVE_SECONDS);
+    if (p.reviveProgress >= 1) this.reviveNow(targetId, p, now);
+  }
+
+  private reviveNow(sessionId: string, p: Player, now: number) {
+    const m = this.meta.get(sessionId);
+    p.downed = false;
+    p.bleed = 0;
+    p.reviveProgress = 0;
+    if (m) {
+      m.invulnUntil = now + REVIVE_INVULN_MS;
+      m.lastX = p.x;
+      m.lastZ = p.z;
+      m.lastMoveAt = now;
+      m.moveBudget = 1;
+      m.staminaLocked = false;
+    }
+    p.stamina = Math.max(p.stamina, 0.4);
+    // shoo anything hovering over the pile before they can even stand up
+    this.clearSpawnArea({ x: p.x, z: p.z });
+    console.log(`[room ${this.roomId}] ${p.name} was helped back up`);
+  }
+
   // ---------- round lifecycle ----------
 
-  private resetRound() {
+  private resetRound(reroll = false) {
     this.state.phase = "active";
     this.state.win = false;
     this.state.extractedTotal = 0;
@@ -267,8 +489,16 @@ export class GameRoom extends Room<GameState> {
     this.state.archivesUnlocked = false;
     this.state.shortcutOpen = false;
 
-    // Base difficulty is the player-count mode (solo = 15 items / quota 10 /
-    // 6min, crew = 22 / 20 / 10min); the current shift escalates on top of it.
+    // A new shift is a new arrangement of the building. Tests that pinned a
+    // descriptor keep theirs so their assertions stay meaningful.
+    if (reroll && !this.pinnedLayout) {
+      this.gen = generateLayout();
+      this.state.layout = JSON.stringify(this.gen.descriptor);
+    }
+    this.resetDoors();
+
+    // Base difficulty is the player-count mode (solo = 15 items / quota 24 /
+    // 6min, crew = 22 / 44 / 10min); the current shift escalates on top of it.
     // Explicit room options still pin quota/time/enemies for tests.
     const mode = this.state.players.size >= 2 ? MULTI_MODE : SOLO_MODE;
     const plan = planShift(this.state.shift, mode, this.baseEnemies);
@@ -277,13 +507,20 @@ export class GameRoom extends Room<GameState> {
       plan.loot,
       plan.loot >= 20 ? 3.2 : 4.5
     );
-    this.state.quota = clamp(this.optQuota || plan.quota, 1, this.lootPicks.length);
+    // quota is a VALUE target, so it can never exceed what is on the floor
+    const mapValue = this.lootPicks.reduce((sum, c) => sum + lootValue(c.kind), 0);
+    this.state.quota = clamp(this.optQuota || plan.quota, 1, mapValue);
     this.roundSeconds = this.optSeconds || plan.seconds;
     this.roundEndsAt = Date.now() + this.roundSeconds * 1000;
     this.state.timeLeft = this.roundSeconds;
     this.spawnLoot();
+
     // deeper shifts bring more monsters (up to MAX_ENEMIES); a pinned count holds
     this.ensureEnemyCount(this.enemiesPinned ? this.baseEnemies : plan.enemies);
+    // Re-point every AI at the current layout — after a re-roll the old nav
+    // graph, sight system and patrol route are all stale.
+    const total = this.ais.length;
+    this.ais.forEach((ai, i) => ai.setWorld(this.makeEnemyWorld(i, total)));
     // new monsters are rolled every round — distinct variants when possible
     const variants = (Object.keys(ENEMY_VARIANTS) as EnemyVariant[]).sort(
       () => Math.random() - 0.5
@@ -297,25 +534,41 @@ export class GameRoom extends Room<GameState> {
     });
 
     const now = Date.now();
+    const spawnPoints = this.gen.layout.spawnPoints;
+    let slot = 0;
     this.state.players.forEach((p, sessionId) => {
       const m = this.meta.get(sessionId);
       if (!m) return;
-      p.x = m.spawn.x;
+      // spawn ends flip between layouts, so re-seat everyone every round
+      const spawn = spawnPoints[slot++ % spawnPoints.length];
+      m.spawn = { x: spawn.x, z: spawn.z };
+      p.x = spawn.x;
       p.y = 1.05;
-      p.z = m.spawn.z;
+      p.z = spawn.z;
       p.carrying = 0;
       p.extractedCount = 0;
+      p.extractedValue = 0;
       p.deaths = 0;
       p.stamina = 1;
+      p.crouching = false;
+      p.noise = NOISE_IDLE;
+      p.battery = 1;
+      p.cells = this.cellsPerPlayer();
+      p.downed = false;
+      p.bleed = 0;
+      p.reviveProgress = 0;
       // grace window so nobody dies before they've even gotten their bearings
       m.invulnUntil = now + START_INVULN_MS;
       m.ignoreMovesUntil = now + IGNORE_MOVES_MS;
-      m.lastX = m.spawn.x;
-      m.lastZ = m.spawn.z;
+      m.lastX = spawn.x;
+      m.lastZ = spawn.z;
       m.lastMoveAt = now + IGNORE_MOVES_MS;
       m.staminaLocked = false;
       m.moveBudget = 1;
-      const tp: TeleportMessage = { x: m.spawn.x, z: m.spawn.z };
+      m.doorCooldownUntil = 0;
+      m.lastReviveAt = now;
+      m.reviveFedAt = 0;
+      const tp: TeleportMessage = { x: spawn.x, z: spawn.z };
       this.clients.find((c) => c.sessionId === sessionId)?.send(MSG.Teleport, tp);
     });
     // now that everyone's placed, evict monsters camping any spawn point
@@ -325,6 +578,25 @@ export class GameRoom extends Room<GameState> {
     });
   }
 
+  /** Everything an EnemyAI needs to read the world it is currently in. */
+  private makeEnemyWorld(index: number, total: number): EnemyWorld {
+    const route = this.gen.layout.patrolRoute;
+    const spawn =
+      index === 0
+        ? this.gen.layout.enemySpawn
+        : this.gen.nav.nodes[route[Math.floor((route.length * index) / Math.max(total, 1))]];
+    return {
+      los: this.gen.los,
+      nav: this.gen.nav,
+      route,
+      spawn,
+      isGateOpen: (gate: GateId) =>
+        gate === "archives" ? this.state.archivesUnlocked : this.state.shortcutOpen,
+      closedDoors: () => this.closedDoors,
+      forceDoor: (index2: number) => this.forceDoor(index2),
+    };
+  }
+
   /**
    * Grow the roster to `target` monsters (add-only, capped at MAX_ENEMIES).
    * Escalation never removes a monster mid-run, so client-side enemy views
@@ -332,25 +604,10 @@ export class GameRoom extends Room<GameState> {
    */
   private ensureEnemyCount(target: number) {
     const want = clamp(Math.floor(target), 1, MAX_ENEMIES);
-    const route = this.gen.layout.patrolRoute;
-    const isGateOpen = (gate: GateId) =>
-      gate === "archives" ? this.state.archivesUnlocked : this.state.shortcutOpen;
     for (let i = this.ais.length; i < want; i++) {
       const e = new Enemy();
       this.state.enemies.set(`e${i}`, e);
-      const spawn =
-        i === 0
-          ? this.gen.layout.enemySpawn
-          : this.gen.nav.nodes[route[Math.floor((route.length * i) / want)]];
-      this.ais.push(
-        new EnemyAI(e, {
-          los: this.gen.los,
-          nav: this.gen.nav,
-          route,
-          spawn,
-          isGateOpen,
-        })
-      );
+      this.ais.push(new EnemyAI(e, this.makeEnemyWorld(i, want)));
     }
   }
 
@@ -369,15 +626,24 @@ export class GameRoom extends Room<GameState> {
   private endRound(win: boolean) {
     this.state.phase = "ended";
     this.state.win = win;
+    const earned = creditsEarned(this.state.extractedTotal, win);
+    this.state.credits += earned;
+    // nobody stays on the floor through the debrief
+    this.state.players.forEach((p) => {
+      p.downed = false;
+      p.bleed = 0;
+      p.reviveProgress = 0;
+    });
     console.log(
       `[room ${this.roomId}] round over: ${win ? "WIN" : "TIMEOUT"} ` +
-      `(${this.state.extractedTotal}/${this.state.quota} extracted)`
+      `(${this.state.extractedTotal}/${this.state.quota} value, +${earned} credits)`
     );
   }
 
   private simTick(dtMs: number) {
     if (this.state.phase !== "active") return;
     const now = Date.now();
+    const dt = Math.min(dtMs, 100) / 1000;
 
     const left = Math.max(0, Math.ceil((this.roundEndsAt - now) / 1000));
     if (left !== this.state.timeLeft) this.state.timeLeft = left;
@@ -385,6 +651,8 @@ export class GameRoom extends Room<GameState> {
       this.endRound(false);
       return;
     }
+
+    this.tickPlayers(dt, now);
 
     const players: TrackedPlayer[] = [];
     this.state.players.forEach((player, sessionId) => {
@@ -397,45 +665,64 @@ export class GameRoom extends Room<GameState> {
 
     if (this.enemyEnabled) {
       for (const ai of this.ais) {
-        ai.update(
-          Math.min(dtMs, 100) / 1000,
-          now,
-          players,
-          (sessionId) => {
-            const killSpot = this.state.players.get(sessionId);
-            const at = killSpot ? { x: killSpot.x, z: killSpot.z } : null;
-            this.killPlayer(sessionId, now);
-            // the catcher vanishes to a random far patrol spot — no
-            // camping the kill site, and no one knows where it went
-            this.scatterEnemy(ai, at);
-          }
-        );
+        ai.update(dt, now, players, (sessionId) => {
+          const victim = this.state.players.get(sessionId);
+          const at = victim ? { x: victim.x, z: victim.z } : null;
+          this.catchPlayer(sessionId, now);
+          // the catcher vanishes to a random far patrol spot — no
+          // camping the kill site, and no one knows where it went
+          this.scatterEnemy(ai, at);
+        });
       }
     }
 
     this.checkExtraction();
   }
 
+  /** Battery burn, bleed-out, and revive decay. */
+  private tickPlayers(dt: number, now: number) {
+    this.state.players.forEach((p, sessionId) => {
+      if (p.torch && p.battery > 0) {
+        p.battery = Math.max(0, p.battery - BATTERY_DRAIN_PER_S * dt);
+        if (p.battery <= 0) p.torch = false;
+      }
+      if (!p.downed) return;
+
+      const m = this.meta.get(sessionId);
+      if (m && now - m.reviveFedAt > REVIVE_STALE_MS && p.reviveProgress > 0) {
+        p.reviveProgress = Math.max(0, p.reviveProgress - REVIVE_DECAY_PER_S * dt);
+      }
+      p.bleed = Math.max(0, p.bleed - dt);
+      if (p.bleed <= 0) {
+        console.log(`[room ${this.roomId}] ${p.name} bled out`);
+        this.respawn(sessionId, now);
+      }
+    });
+  }
+
   private checkExtraction() {
     const zone = this.gen.layout.extractionZone;
     let banked = 0;
     this.state.players.forEach((p, sessionId) => {
-      if (p.carrying === 0) return;
+      if (p.carrying === 0 || p.downed) return;
       if (Math.abs(p.x - zone.x) > zone.sx / 2) return;
       if (Math.abs(p.z - zone.z) > zone.sz / 2) return;
 
       let n = 0;
+      let value = 0;
       this.state.loot.forEach((l) => {
         if (l.carrier === sessionId) {
           l.carrier = "";
           l.extracted = true;
           n++;
+          value += lootValue(l.kind);
         }
       });
       p.carrying = 0;
       p.extractedCount += n;
-      banked += n;
-      console.log(`[room ${this.roomId}] ${p.name} extracted ${n} item(s)`);
+      p.extractedValue += value;
+      banked += value;
+      console.log(`[room ${this.roomId}] ${p.name} banked ${n} item(s) worth ${value}`);
     });
 
     if (banked > 0) {
@@ -475,26 +762,61 @@ export class GameRoom extends Room<GameState> {
     }
   }
 
-  private killPlayer(sessionId: string, now: number) {
-    const p = this.state.players.get(sessionId);
-    const m = this.meta.get(sessionId);
-    if (!p || !m) return;
-
-    const dropX = p.x;
-    const dropZ = p.z;
+  private dropCarried(sessionId: string, x: number, z: number): number {
     let i = 0;
     this.state.loot.forEach((l) => {
       if (l.carrier !== sessionId) return;
       const [ox, oz] = DROP_SCATTER[i % DROP_SCATTER.length];
       l.carrier = "";
-      l.x = clamp(dropX + ox, MAP_BOUNDS.minX, MAP_BOUNDS.maxX);
-      l.z = clamp(dropZ + oz, MAP_BOUNDS.minZ, MAP_BOUNDS.maxZ);
+      l.x = clamp(x + ox, MAP_BOUNDS.minX, MAP_BOUNDS.maxX);
+      l.z = clamp(z + oz, MAP_BOUNDS.minZ, MAP_BOUNDS.maxZ);
       l.y = LOOT_GROUND_Y;
       i++;
     });
+    return i;
+  }
 
+  /**
+   * Caught. You drop the haul where you fall and go down — a teammate has
+   * REVIVE_SECONDS of holding interact to get you back up before you bleed
+   * out. With nobody left standing there is no one to come for you, so the
+   * floor is skipped and you respawn straight away (at the usual cost).
+   */
+  private catchPlayer(sessionId: string, now: number) {
+    const p = this.state.players.get(sessionId);
+    const m = this.meta.get(sessionId);
+    if (!p || !m) return;
+
+    const dropped = this.dropCarried(sessionId, p.x, p.z);
     p.carrying = 0;
     p.deaths++;
+    console.log(`[room ${this.roomId}] ${p.name} was caught (dropped ${dropped})`);
+
+    if (this.hasRescuer(sessionId)) {
+      p.downed = true;
+      p.bleed = BLEED_OUT_SECONDS;
+      p.reviveProgress = 0;
+      m.reviveFedAt = 0;
+      m.ignoreMovesUntil = now + IGNORE_MOVES_MS;
+      return;
+    }
+    this.respawn(sessionId, now);
+  }
+
+  /** Back at the spawn point — and the whole crew pays for the walk back. */
+  private respawn(sessionId: string, now: number) {
+    const p = this.state.players.get(sessionId);
+    const m = this.meta.get(sessionId);
+    if (!p || !m) return;
+
+    // anything still in hand hits the floor here, not at the spawn
+    this.dropCarried(sessionId, p.x, p.z);
+    p.carrying = 0;
+    p.downed = false;
+    p.bleed = 0;
+    p.reviveProgress = 0;
+    p.crouching = false;
+    p.noise = NOISE_IDLE;
     m.invulnUntil = now + RESPAWN_INVULN_MS;
     m.ignoreMovesUntil = now + IGNORE_MOVES_MS;
     p.x = m.spawn.x;
@@ -504,6 +826,9 @@ export class GameRoom extends Room<GameState> {
     m.lastZ = m.spawn.z;
     m.lastMoveAt = now + IGNORE_MOVES_MS;
     m.moveBudget = 1;
+    m.staminaLocked = false;
+    // the clock is the real cost of dying
+    this.roundEndsAt -= BLEED_TIME_PENALTY * 1000;
     // clear any monster already camping the respawn point (the catcher is
     // scattered separately by the caller; this handles the rest)
     this.clearSpawnArea(m.spawn);
@@ -511,7 +836,6 @@ export class GameRoom extends Room<GameState> {
     const client = this.clients.find((c) => c.sessionId === sessionId);
     const death: DeathMessage = { x: m.spawn.x, z: m.spawn.z };
     client?.send(MSG.Death, death);
-    console.log(`[room ${this.roomId}] ${p.name} was caught (dropped ${i})`);
   }
 
   // ---------- membership ----------
@@ -527,6 +851,7 @@ export class GameRoom extends Room<GameState> {
     p.x = spawn.x;
     p.z = spawn.z;
     p.colorIndex = idx % spawnPoints.length;
+    p.cells = this.cellsPerPlayer();
 
     this.state.players.set(client.sessionId, p);
     this.meta.set(client.sessionId, {
@@ -538,6 +863,9 @@ export class GameRoom extends Room<GameState> {
       lastMoveAt: Date.now(),
       staminaLocked: false,
       moveBudget: 1,
+      doorCooldownUntil: 0,
+      lastReviveAt: Date.now(),
+      reviveFedAt: 0,
     });
     console.log(
       `[room ${this.roomId}] ${p.name} joined (${this.state.players.size}/${this.maxClients})`
@@ -555,21 +883,19 @@ export class GameRoom extends Room<GameState> {
 
   onLeave(client: Client) {
     const p = this.state.players.get(client.sessionId);
-    if (p) {
-      let i = 0;
-      this.state.loot.forEach((l) => {
-        if (l.carrier !== client.sessionId) return;
-        const [ox, oz] = DROP_SCATTER[i % DROP_SCATTER.length];
-        l.carrier = "";
-        l.x = clamp(p.x + ox, MAP_BOUNDS.minX, MAP_BOUNDS.maxX);
-        l.z = clamp(p.z + oz, MAP_BOUNDS.minZ, MAP_BOUNDS.maxZ);
-        l.y = LOOT_GROUND_Y;
-        i++;
-      });
-    }
+    if (p) this.dropCarried(client.sessionId, p.x, p.z);
     this.state.players.delete(client.sessionId);
     this.meta.delete(client.sessionId);
     console.log(`[room ${this.roomId}] ${p?.name ?? client.sessionId} left`);
+
+    // the last person standing can't be revived by a ghost: stand anybody
+    // still on the floor back up rather than let them bleed out alone
+    if (this.state.phase === "active") {
+      const now = Date.now();
+      this.state.players.forEach((q, id) => {
+        if (q.downed && !this.hasRescuer(id)) this.respawn(id, now);
+      });
+    }
   }
 
   onDispose() {

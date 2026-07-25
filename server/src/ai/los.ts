@@ -19,7 +19,7 @@ export interface LosSystem {
   gateRects: Record<GateId, Rect[]>;
 }
 
-const toRect = (b: { x: number; z: number; sx: number; sz: number }): Rect => ({
+export const toRect = (b: { x: number; z: number; sx: number; sz: number }): Rect => ({
   minX: b.x - b.sx / 2,
   maxX: b.x + b.sx / 2,
   minZ: b.z - b.sz / 2,
@@ -51,7 +51,7 @@ export function createLos(boxes: BoxDef[], gateDoors: GateDoorDef[]): LosSystem 
   return { losClear, gateRects };
 }
 
-function segmentHitsRect(
+export function segmentHitsRect(
   x0: number, z0: number, x1: number, z1: number, r: Rect
 ): boolean {
   const dx = x1 - x0;

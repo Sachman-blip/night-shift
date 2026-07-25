@@ -14,6 +14,7 @@
     "smoke:map": "tsx scripts/smoke-map.ts",
     "smoke:stamina": "tsx scripts/smoke-stamina.ts",
     "smoke:assembly": "tsx scripts/smoke-assembly.ts",
+    "smoke:systems": "tsx scripts/smoke-systems.ts",
     "smoke:voice": "tsx scripts/smoke-voice.ts"
   },
   "dependencies": {
