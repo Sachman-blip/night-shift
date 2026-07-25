@@ -20,11 +20,8 @@ less every shift you clear.
 Being quiet is the whole game. The monster's hearing scales with the noise you
 are actually making, so sprinting is a decision and not a default; crouch and
 you are nearly silent and much harder to see, at just under half walking pace.
-Your
-flashlight burns a battery that only drains while the beam is on, which makes
-the dark a resource you spend. Shut a door behind you and it breaks line of
-sight and physically holds the thing — until it tears the door off the latch,
-which you will hear.
+Your flashlight burns a battery that only drains while the beam is on, which
+makes the dark a resource you spend.
 
 Get caught and you drop your whole haul and go down where you fell, bleeding
 out with about forty-five seconds for somebody to hold **E** over you. Alone,
@@ -59,15 +56,15 @@ on its own.
 | `npm run smoke:round -w server` | loot/extraction/round-lifecycle test |
 | `npm run smoke:shift -w server` | escalating shift progression (win advances/escalates, loss repeats) |
 | `npm run smoke:map -w server` | loot spread, gates, patrol coverage, paced full-round bot |
-| `npm run smoke:systems -w server` | stealth, doors, gear, rescue, economy (7 sections) |
+| `npm run smoke:systems -w server` | stealth, gear, rescue, economy (5 sections) |
 | `npm run smoke:reroll -w server` | the between-shift map re-roll, and the AI navigating the new plan |
 | `npm run smoke:assembly -w server` | 30 random layouts vs all constraints (pure, no server) |
 | `npm run smoke:stamina -w server` | server-side sprint speed clamp |
 | `npm run smoke:voice -w server` | WebRTC signaling relay |
 
-Controls: **WASD** move · **Shift** sprint · **C** or hold **Ctrl** crouch ·
+Controls: **WASD** move · **Shift** sprint · **C** toggle crouch or hold **X** ·
 **Space** jump · **F** flashlight · **R** load a fresh cell · **E** interact
-(grab loot, open/shut a door, or hold over a downed teammate to revive them) ·
+(grab loot, or hold over a downed teammate to revive them) ·
 click to capture the mouse.
 
 ## Architecture
@@ -75,19 +72,18 @@ click to capture the mouse.
 ```
 shared/     protocol + map data (single source of truth, zero dependencies)
   messages.ts   message names, rates, payload shapes, movement/noise/gear tuning
-  map.ts        chunk geometry, doors, nav graph, spawns, bounds, light fixtures
+  map.ts        chunk geometry, nav graph, spawns, bounds, light fixtures
   loot.ts       loot types + values, round/shift scaling, the upgrade shop
 server/     Colyseus 0.16 (Node)
   GameRoom      4-letter room codes, 20hz state patches, bounds clamping,
-                doors, extraction, downed/revive, credits
-  ai/EnemyAI    patrol -> chase -> search, perception, door forcing
+                extraction, downed/revive, credits
+  ai/EnemyAI    patrol -> chase -> search, perception
   ai/los, ai/nav  sight rays and the pathfinder over the layout's nav graph
   layout        assembles + validates a room's arrangement, picks loot spots
 client/     Vite + Three.js + Rapier (WASM)
   PlayerController   pointer-lock FPS on Rapier's KinematicCharacterController
   RemotePlayers      interpolated human figures + name tags + torches for teammates
   buildMap           meshes AND colliders generated from shared/map.ts
-  DoorView           swinging door meshes + colliders driven by synced bits
   voice              WebRTC mesh with distance-driven per-peer gain
 ```
 
@@ -160,13 +156,11 @@ Design decisions (locked in):
       (the server relays opaque SDP/ICE and never inspects it), per-peer gain
       driven by the positions already synced at 20hz, so a teammate fades in
       as they get close. `smoke:voice` covers the relay.
-- [x] **Phase 5 — stealth, doors, gear, rescue, economy**: noise tiers derived
+- [x] **Phase 5 — stealth, gear, rescue, economy**: noise tiers derived
       from the speed the SERVER observes (idle 0.25 / crouch 0.4 / walk 1 /
       sprint 1.75) scaling the monster's hearing radius, so claiming to crouch
       while sprinting buys nothing; crouch at 1.55 m/s also shrinks your
-      silhouette while a lit torch enlarges it. Swinging doors players open and
-      shut — they break line of sight AND physically block, and a monster
-      grinds one open in 2.2s (0.65x that if it is already chasing). Flashlight
+      silhouette while a lit torch enlarges it. Flashlight
       batteries that drain only while the beam is lit, with swappable cells.
       Getting caught downs you instead of killing you: you drop the haul, bleed
       out over 45s, and a teammate holding **E** for 4s brings you back — with

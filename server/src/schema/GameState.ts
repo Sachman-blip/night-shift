@@ -1,4 +1,4 @@
-import { Schema, MapSchema, ArraySchema, type } from "@colyseus/schema";
+import { Schema, MapSchema, type } from "@colyseus/schema";
 
 export class Player extends Schema {
   @type("string") name = "";
@@ -37,8 +37,6 @@ export class Enemy extends Schema {
   @type("number") yaw = 0;
   @type("string") aiState = "patrol";
   @type("string") variant = "stalker";
-  /** Currently tearing at a shut door instead of moving. */
-  @type("boolean") forcing = false;
 }
 
 export class Loot extends Schema {
@@ -67,11 +65,6 @@ export class GameState extends Schema {
   @type("boolean") keycardTaken = false;
   @type("boolean") archivesUnlocked = false;
   @type("boolean") shortcutOpen = false;
-  /**
-   * Open/closed bit per swinging door, index-aligned with the layout's
-   * `doors` array (a fixed skeleton feature, so indices are stable).
-   */
-  @type(["boolean"]) doors = new ArraySchema<boolean>();
   /** Crew-wide spendable credit, carried between shifts. */
   @type("uint16") credits = 0;
   /** Purchased upgrade levels, keyed by UPGRADES id. */

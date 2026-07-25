@@ -42,7 +42,7 @@ export class PlayerController {
   staminaDrainScale = 1;
   /** How loud this client believes it is, for the HUD meter (0.25..1.75). */
   noise = 0.25;
-  /** Fired on interact press while pointer-locked (grab / door / gear). */
+  /** Fired on interact press while pointer-locked (grab / revive / gear). */
   onInteract?: () => void;
   /** Fired on R: load a fresh flashlight cell. */
   onSwapCell?: () => void;
@@ -132,7 +132,10 @@ export class PlayerController {
     if (e.code === "KeyF") this.torch = !this.torch;
     if (e.code === "KeyE") this.onInteract?.();
     if (e.code === "KeyR") this.onSwapCell?.();
-    // hold Ctrl or toggle C — both idioms show up in this genre
+    // Tap C to toggle, hold X for the press-and-hold idiom. Ctrl is
+    // deliberately NOT bound: Ctrl+W is a reserved browser shortcut that a
+    // page cannot preventDefault(), so hold-crouching forward would close
+    // the tab — the most common stealth input in the game.
     if (e.code === "KeyC") this.crouching = !this.crouching;
   };
 
@@ -148,9 +151,9 @@ export class PlayerController {
     );
   };
 
-  /** True when the player is ducking this frame (toggle or held Ctrl). */
+  /** True when the player is ducking this frame (C toggle or held X). */
   get ducking(): boolean {
-    return this.crouching || this.keys.has("ControlLeft") || this.keys.has("ControlRight");
+    return this.crouching || this.keys.has("KeyX");
   }
 
   update(dt: number) {

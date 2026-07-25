@@ -11,7 +11,7 @@
 
 type StingKind =
   | "pickup" | "bank" | "death" | "win" | "loss" | "unlock"
-  | "door" | "forced" | "revive" | "cell" | "buy";
+  | "revive" | "cell" | "buy";
 
 const ENEMY_AUDIO_RANGE = 25; // silent beyond this distance (m)
 
@@ -205,18 +205,6 @@ export class AudioEngine {
         this.tone(160, "square", t, 0.1, 0.09, 120);
         this.tone(90, "sine", t + 0.06, 0.25, 0.12);
         break;
-      case "door": // a door swinging shut: wooden thud + latch tick
-        this.noiseBurst(t, 0.14, 0.09, 260);
-        this.tone(120, "sine", t, 0.13, 0.1, 74);
-        this.noiseBurst(t + 0.1, 0.05, 0.03, 2600);
-        break;
-      case "forced": {
-        // something tore a door open somewhere: splinter + a falling groan
-        this.noiseBurst(t, 0.3, 0.13, 1500);
-        this.noiseBurst(t + 0.05, 0.4, 0.09, 500);
-        this.tone(190, "sawtooth", t, 0.5, 0.11, 62);
-        break;
-      }
       case "revive": // pulled back to your feet
         [392, 523, 659].forEach((f, i) =>
           this.tone(f, "sine", t + i * 0.11, 0.35, 0.08)

@@ -53,7 +53,7 @@ const nearestNode = (nav: NavSystem, x: number, z: number) =>
 /** Throws with a specific reason if the layout violates any constraint. */
 export function validateLayout(layout: Layout, los: LosSystem, nav: NavSystem) {
   // 1. every nav edge is a straight sight-clear walk (gated edges are
-  //    checked with their door absent — doors aren't static geometry)
+  //    checked with their gate panel absent — gates aren't static geometry)
   for (const { a, b } of layout.navEdges) {
     const na = nav.nodes[a];
     const nb = nav.nodes[b];

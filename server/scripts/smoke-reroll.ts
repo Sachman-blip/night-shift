@@ -164,16 +164,6 @@ async function main() {
         );
       }
 
-      // door bits are re-sized to the new arrangement and all start open
-      if (s.doors.length !== L.doors.length) {
-        throw new Error(
-          `round ${r}: ${s.doors.length} door bits for ${L.doors.length} doors`
-        );
-      }
-      if (!s.doors.every((d: boolean) => d === true)) {
-        throw new Error(`round ${r}: a shift started with a door already shut`);
-      }
-
       // Every item on the floor has to be a candidate of the NEW layout.
       // Loot carried over from the previous arrangement would land inside a
       // wall or out in the void, and this is what would catch it.
@@ -216,7 +206,7 @@ async function main() {
       Object.keys(snap(room).enemies).sort().join(",") === enemyIds,
       "enemy ids survive the re-roll (client views stay valid)"
     );
-    console.log("  ok: spawns, doors, loot, quota and gates all matched each new map");
+    console.log("  ok: spawns, loot, quota and gates all matched each new map");
     await room.leave();
   }
 

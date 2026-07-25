@@ -2,13 +2,12 @@
 // movement happen here; the client only receives position/yaw/state.
 
 import type { GateId } from "../../../shared/map";
-import { segmentHitsRect, type LosSystem, type Rect } from "./los";
+import type { LosSystem, Rect } from "./los";
 import type { NavSystem, IsGateOpen } from "./nav";
 import type { Enemy, Player } from "../schema/GameState";
 import {
   TORCH_VISION_SCALE,
   CROUCH_VISION_SCALE,
-  DOOR_FORCE_SECONDS,
 } from "../../../shared/messages";
 
 // Variant tuning only - identical state machine, different senses/speeds.
@@ -32,19 +31,11 @@ const KILL_RADIUS = 1.1;
 const KILL_HEIGHT = 1.6;
 const ARRIVE_DIST = 0.3;
 const SCAN_SPEED = 2.4;
-/** Something already hunting you tears through a door faster. */
-const CHASE_FORCE_SCALE = 0.65;
 
 export interface TrackedPlayer {
   sessionId: string;
   player: Player;
   invulnerable: boolean;
-}
-
-/** A shut swinging door, with the index the room uses to open it. */
-export interface DoorBlocker {
-  index: number;
-  rect: Rect;
 }
 
 export interface EnemyWorld {
@@ -53,10 +44,6 @@ export interface EnemyWorld {
   route: string[];
   spawn: { x: number; z: number };
   isGateOpen: IsGateOpen;
-  /** Doors that are shut right now: they hide players and stop movement. */
-  closedDoors: () => DoorBlocker[];
-  /** Tear a door off its latch (index into the layout's door list). */
-  forceDoor: (index: number) => void;
 }
 
 export class EnemyAI {
@@ -65,10 +52,6 @@ export class EnemyAI {
   private lastDetectedAt = 0;
   private searchArrivedAt: number | null = null;
   private tune: (typeof ENEMY_VARIANTS)[EnemyVariant] = ENEMY_VARIANTS.stalker;
-  /** Door the last movement step ran into, if any (reset every update). */
-  private blockedDoor: number | null = null;
-  private forcingIndex: number | null = null;
-  private forceProgress = 0;
 
   constructor(private enemy: Enemy, private world: EnemyWorld) {
     this.reset("stalker");
@@ -94,13 +77,9 @@ export class EnemyAI {
     this.enemy.y = 1.05;
     this.enemy.yaw = 0;
     this.enemy.aiState = "patrol";
-    this.enemy.forcing = false;
     this.lastKnown = { x: spawn.x, z: spawn.z };
     this.lastDetectedAt = 0;
     this.searchArrivedAt = null;
-    this.blockedDoor = null;
-    this.forcingIndex = null;
-    this.forceProgress = 0;
     // resume at the route stop nearest this enemy's own spawn, so multiple
     // enemies sharing the route start spread out instead of converging
     this.toPatrol();
@@ -111,10 +90,7 @@ export class EnemyAI {
     this.enemy.x = x;
     this.enemy.z = z;
     this.enemy.aiState = "patrol";
-    this.enemy.forcing = false;
     this.searchArrivedAt = null;
-    this.forcingIndex = null;
-    this.forceProgress = 0;
     this.toPatrol();
   }
 
@@ -139,15 +115,7 @@ export class EnemyAI {
     kill: (sessionId: string) => void
   ) {
     const e = this.enemy;
-    // Gates are permanent barriers the AI routes around. Doors are not: it
-    // navigates as though they were open, walks into whichever one is shut,
-    // and tears it off - which is the entire point of closing one.
     const gates = this.closedGateRects();
-    const doors = this.world.closedDoors();
-    const sightBlockers = doors.length
-      ? [...gates, ...doors.map((d) => d.rect)]
-      : gates;
-    this.blockedDoor = null;
 
     for (const t of players) {
       if (t.invulnerable || t.player.downed) continue;
@@ -164,7 +132,7 @@ export class EnemyAI {
     for (const t of players) {
       if (t.invulnerable || t.player.downed) continue;
       const d = Math.hypot(t.player.x - e.x, t.player.z - e.z);
-      if (d < nearestD && this.canDetect(t.player, d, sightBlockers)) {
+      if (d < nearestD && this.canDetect(t.player, d, gates)) {
         nearest = t;
         nearestD = d;
       }
@@ -178,7 +146,7 @@ export class EnemyAI {
 
     switch (e.aiState) {
       case "chase": {
-        this.navigateToward(this.lastKnown.x, this.lastKnown.z, this.tune.chase, dt, gates, doors);
+        this.navigateToward(this.lastKnown.x, this.lastKnown.z, this.tune.chase, dt, gates);
         if (now - this.lastDetectedAt > LOSE_SIGHT_MS) {
           e.aiState = "search";
           this.searchArrivedAt = null;
@@ -187,7 +155,7 @@ export class EnemyAI {
       }
       case "search": {
         const arrived = this.navigateToward(
-          this.lastKnown.x, this.lastKnown.z, this.tune.search, dt, gates, doors
+          this.lastKnown.x, this.lastKnown.z, this.tune.search, dt, gates
         );
         if (arrived) {
           if (this.searchArrivedAt === null) this.searchArrivedAt = now;
@@ -201,37 +169,10 @@ export class EnemyAI {
       default: {
         const { route, nav } = this.world;
         const stop = nav.nodes[route[this.routeIndex]];
-        if (this.navigateToward(stop.x, stop.z, this.tune.patrol, dt, gates, doors)) {
+        if (this.navigateToward(stop.x, stop.z, this.tune.patrol, dt, gates)) {
           this.routeIndex = (this.routeIndex + 1) % route.length;
         }
       }
-    }
-
-    this.updateForcing(dt);
-  }
-
-  /** Grind down whichever door the movement step ran into this tick. */
-  private updateForcing(dt: number) {
-    const e = this.enemy;
-    if (this.blockedDoor === null) {
-      this.forcingIndex = null;
-      this.forceProgress = 0;
-      e.forcing = false;
-      return;
-    }
-    if (this.forcingIndex !== this.blockedDoor) {
-      this.forcingIndex = this.blockedDoor;
-      this.forceProgress = 0;
-    }
-    e.forcing = true;
-    this.forceProgress += dt;
-    const needed =
-      DOOR_FORCE_SECONDS * (e.aiState === "chase" ? CHASE_FORCE_SCALE : 1);
-    if (this.forceProgress >= needed) {
-      this.world.forceDoor(this.forcingIndex);
-      this.forcingIndex = null;
-      this.forceProgress = 0;
-      e.forcing = false;
     }
   }
 
@@ -271,13 +212,12 @@ export class EnemyAI {
   }
 
   private navigateToward(
-    tx: number, tz: number, speed: number, dt: number,
-    gates: Rect[], doors: DoorBlocker[]
+    tx: number, tz: number, speed: number, dt: number, gates: Rect[]
   ): boolean {
     const e = this.enemy;
     const { los, nav, isGateOpen } = this.world;
     if (los.losClear(e.x, e.z, tx, tz, gates)) {
-      return this.stepToward(tx, tz, speed, dt, doors);
+      return this.stepToward(tx, tz, speed, dt);
     }
     const path = nav.findPath(
       nav.nearestVisibleNode(e.x, e.z),
@@ -292,31 +232,20 @@ export class EnemyAI {
       i++;
     }
     const n = nav.nodes[path[i]];
-    this.stepToward(n.x, n.z, speed, dt, doors);
+    this.stepToward(n.x, n.z, speed, dt);
     return false;
   }
 
-  private stepToward(
-    tx: number, tz: number, speed: number, dt: number, doors: DoorBlocker[]
-  ): boolean {
+  private stepToward(tx: number, tz: number, speed: number, dt: number): boolean {
     const e = this.enemy;
     const dx = tx - e.x;
     const dz = tz - e.z;
     const d = Math.hypot(dx, dz);
     if (d <= ARRIVE_DIST) return true;
     const step = Math.min(speed * dt, d);
-    const nx = e.x + (dx / d) * step;
-    const nz = e.z + (dz / d) * step;
-    // face the way it wants to go even while a door holds it back
+    e.x += (dx / d) * step;
+    e.z += (dz / d) * step;
     e.yaw = Math.atan2(-dx, -dz);
-    for (const door of doors) {
-      if (segmentHitsRect(e.x, e.z, nx, nz, door.rect)) {
-        this.blockedDoor = door.index;
-        return false;
-      }
-    }
-    e.x = nx;
-    e.z = nz;
     return false;
   }
 }

@@ -13,14 +13,12 @@ import {
   BATTERY_LOW,
   BLEED_OUT_SECONDS,
   REVIVE_RADIUS,
-  DOOR_INTERACT_RADIUS,
   NOISE_CROUCH,
   NOISE_WALK,
   NOISE_SPRINT,
   type PlayerState,
   type DeathMessage,
   type TeleportMessage,
-  type ForcedMessage,
   type RoundPhase,
 } from "../../../shared/messages";
 import {
@@ -37,7 +35,6 @@ import { RemotePlayers } from "./RemotePlayers";
 import { EnemyView } from "./EnemyView";
 import { LootView } from "./LootView";
 import { GateView } from "./GateView";
-import { DoorView } from "./DoorView";
 import { TouchControls } from "./TouchControls";
 import { AudioEngine } from "./audio";
 import { VoiceChat } from "./voice";
@@ -53,7 +50,7 @@ const FLASHLIGHT_INTENSITY = 30;
 const REVIVE_SEND_MS = 100;
 
 /** What pressing interact would do right now. */
-type InteractKind = "revive" | "pickup" | "door";
+type InteractKind = "revive" | "pickup";
 interface InteractTarget {
   kind: InteractKind;
   label: string;
@@ -80,14 +77,12 @@ export class Game {
   private objectivesHtml = "";
   private shopHtml = "";
   private gateView!: GateView;
-  private doorView!: DoorView;
   private audio = new AudioEngine();
   private prevCarrying = 0;
   private prevExtractedTotal = 0;
   private prevArchives = false;
   private prevShortcut = false;
   private prevDowned = false;
-  private prevDoors: boolean[] = [];
   private ambientIn = 20;
   private composer!: EffectComposer;
   private grainPass!: ShaderPass;
@@ -159,6 +154,9 @@ export class Game {
     this.toast("FIND LOOT · PRESS E TO GRAB · BANK IT AT THE GREEN EXTRACT LIGHT");
 
     window.addEventListener("resize", this.onResize);
+    // Ctrl+W is muscle memory and no page can intercept it, so the best we can
+    // do is refuse to go quietly while a shift is actually running.
+    window.addEventListener("beforeunload", this.onBeforeUnload);
     this.running = true;
     this.renderer.setAnimationLoop(() => this.tick());
 
@@ -197,8 +195,6 @@ export class Game {
       this.scene, this.world, RAPIER,
       this.layout.gateDoors, this.layout.keycardPos, this.layout.breakerPos
     );
-    this.doorView = new DoorView(this.scene, this.world, RAPIER, this.layout.doors);
-    this.prevDoors = this.layout.doors.map(() => true);
   }
 
   /**
@@ -210,7 +206,6 @@ export class Game {
     disposeMap(this.scene, this.world, this.map);
     this.lootView.dispose();
     this.gateView.dispose(this.scene);
-    this.doorView.dispose(this.scene);
 
     this.buildWorld(layoutJson);
 
@@ -357,17 +352,6 @@ export class Game {
       this.controller.teleport(msg.x, 1.05, msg.z);
     });
 
-    // a monster tore a door off somewhere in the building
-    this.room.onMessage(MSG.Forced, (msg: ForcedMessage) => {
-      this.doorView.slam(msg.index);
-      this.audio.sting("forced");
-      const d = Math.hypot(
-        msg.x - this.camera.position.x,
-        msg.z - this.camera.position.z
-      );
-      if (d < 18) this.toast("SOMETHING JUST CAME THROUGH A DOOR");
-    });
-
     this.room.onLeave(() => {
       this.running = false;
       this.renderer.setAnimationLoop(null);
@@ -437,10 +421,6 @@ export class Game {
       return { kind: "pickup", label: `GRAB ${near.label} (${near.value})` };
     }
 
-    const door = this.doorView.nearest(self.x, self.z);
-    if (door.index >= 0 && door.dist <= DOOR_INTERACT_RADIUS) {
-      return { kind: "door", label: door.open ? "SHUT THE DOOR" : "OPEN THE DOOR" };
-    }
     return null;
   }
 
@@ -451,7 +431,7 @@ export class Game {
     if (!target) return;
     // revives are a hold, driven per-frame from tick(); a tap does nothing
     if (target.kind === "revive") return;
-    this.room.send(target.kind === "door" ? MSG.Door : MSG.Pickup);
+    this.room.send(MSG.Pickup);
   }
 
   // ---------- per-frame ----------
@@ -522,8 +502,6 @@ export class Game {
     });
     this.lootView.sync(st.loot, this.elapsed, dt);
     this.gateView.sync(st);
-    this.doorView.sync(st.doors, dt);
-    this.syncDoorAudio(st);
     updateFlickers(this.map.flickers, dt);
 
     // gate unlock feedback
@@ -635,24 +613,6 @@ export class Game {
     }
   }
 
-  /** Wooden thud whenever a door near you swings shut by hand. */
-  private syncDoorAudio(st: any) {
-    const doors = st.doors;
-    if (!doors) return;
-    for (let i = 0; i < this.prevDoors.length; i++) {
-      const open = doors[i] !== false;
-      if (!open && this.prevDoors[i]) {
-        const d = this.layout.doors[i];
-        const dist = Math.hypot(
-          d.x - this.camera.position.x,
-          d.z - this.camera.position.z
-        );
-        if (dist < 14) this.audio.sting("door");
-      }
-      this.prevDoors[i] = open;
-    }
-  }
-
   private updateHud(st: any, active: boolean, self: any, target: InteractTarget | null) {
     document.getElementById("playerCount")!.textContent = String(
       this.remotes.count + 1
@@ -722,8 +682,8 @@ export class Game {
     if (!st.keycardTaken) {
       obj += `<div class="hintline">◆ grab the SECURITY CARD to open the ARCHIVES</div>`;
     }
-    obj += `<div class="hintline">◆ ${IS_TOUCH ? "DUCK" : "hold CTRL"} to move quietly · `
-      + `shut a door behind you</div>`;
+    obj += `<div class="hintline">◆ ${IS_TOUCH ? "DUCK" : "press C"} to move quietly · `
+      + `stay out of its line of sight</div>`;
     obj += `<div class="warn">☠ don't get caught — you drop your haul</div>`;
     if (obj !== this.objectivesHtml) {
       this.objectivesHtml = obj;
@@ -868,6 +828,18 @@ export class Game {
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(window.innerWidth, window.innerHeight);
     this.composer.setSize(window.innerWidth, window.innerHeight);
+  };
+
+  /**
+   * Ask before throwing away a shift in progress. Only while a round is
+   * actually live — nobody wants to argue with a dialog on the results screen.
+   */
+  private onBeforeUnload = (e: BeforeUnloadEvent) => {
+    if (!this.running) return;
+    const phase = (this.room?.state as any)?.phase;
+    if (phase !== "active") return;
+    e.preventDefault();
+    e.returnValue = "";
   };
 }
 

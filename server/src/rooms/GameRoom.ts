@@ -5,10 +5,8 @@ import {
   ENEMY_VARIANTS,
   type EnemyVariant,
   type EnemyWorld,
-  type DoorBlocker,
   type TrackedPlayer,
 } from "../ai/EnemyAI";
-import { toRect, type Rect } from "../ai/los";
 import { generateLayout, type GeneratedLayout } from "../layout";
 import {
   MSG,
@@ -32,12 +30,9 @@ import {
   REVIVE_INVULN_MS,
   BLEED_OUT_SECONDS,
   BLEED_TIME_PENALTY,
-  DOOR_INTERACT_RADIUS,
-  DOOR_BLOCK_RADIUS,
   type MoveMessage,
   type DeathMessage,
   type TeleportMessage,
-  type ForcedMessage,
   type BuyMessage,
 } from "../../../shared/messages";
 import {
@@ -81,8 +76,6 @@ const SAFE_SPAWN_RADIUS = 16;
 // Post-scatter, a monster lands at least this far from every player and the
 // kill site (also > max vision, so it can't just turn around and re-acquire).
 const SCATTER_MIN_DIST = 15;
-/** Ignore door toggles this soon after the last one (one swing per press). */
-const DOOR_COOLDOWN_MS = 400;
 /** Revive progress decays once the rescuer has been silent this long. */
 const REVIVE_STALE_MS = 400;
 
@@ -102,7 +95,6 @@ interface PlayerMeta {
   lastMoveAt: number;
   staminaLocked: boolean;
   moveBudget: number;
-  doorCooldownUntil: number;
   /** When this player last pushed revive progress into somebody. */
   lastReviveAt: number;
   /** When somebody last fed revive progress into THIS player. */
@@ -143,10 +135,6 @@ export class GameRoom extends Room<GameState> {
   private pinnedLayout?: LayoutDescriptor;
   private baseEnemies = 2;
   private enemiesPinned = false;
-  /** Door panels as 2D rects, index-aligned with the layout's door list. */
-  private doorRects: Rect[] = [];
-  /** Rebuilt whenever a door toggles; read by every AI each tick. */
-  private closedDoors: DoorBlocker[] = [];
 
   async onCreate(options: CreateOptions = {}) {
     this.setPatchRate(PATCH_RATE_MS);
@@ -285,7 +273,6 @@ export class GameRoom extends Room<GameState> {
       }
     });
 
-    this.onMessage(MSG.Door, (client) => this.toggleDoor(client.sessionId));
     this.onMessage(MSG.Revive, (client) => this.feedRevive(client.sessionId));
 
     this.onMessage(MSG.Swap, (client) => {
@@ -350,70 +337,6 @@ export class GameRoom extends Room<GameState> {
 
   private cellsPerPlayer(): number {
     return BASE_CELLS + this.upgradeLevel("cells");
-  }
-
-  // ---------- doors ----------
-
-  private resetDoors() {
-    const defs = this.gen.layout.doors;
-    this.doorRects = defs.map(toRect);
-    this.state.doors.clear();
-    // every shift starts with the building open; shutting one is a choice
-    for (let i = 0; i < defs.length; i++) this.state.doors.push(true);
-    this.refreshClosedDoors();
-  }
-
-  private refreshClosedDoors() {
-    this.closedDoors = [];
-    for (let i = 0; i < this.doorRects.length; i++) {
-      if (!this.state.doors[i]) {
-        this.closedDoors.push({ index: i, rect: this.doorRects[i] });
-      }
-    }
-  }
-
-  /** A monster finished tearing at a door: it swings open, loudly. */
-  private forceDoor(index: number) {
-    if (this.state.doors[index] !== false) return;
-    this.state.doors[index] = true;
-    this.refreshClosedDoors();
-    const d = this.gen.layout.doors[index];
-    const msg: ForcedMessage = { index, x: d.x, z: d.z };
-    this.broadcast(MSG.Forced, msg);
-  }
-
-  private toggleDoor(sessionId: string) {
-    if (this.state.phase !== "active") return;
-    const p = this.state.players.get(sessionId);
-    const m = this.meta.get(sessionId);
-    if (!p || !m || p.downed) return;
-    const now = Date.now();
-    if (m.doorCooldownUntil > now) return;
-
-    const defs = this.gen.layout.doors;
-    let best = -1;
-    let bestD = DOOR_INTERACT_RADIUS;
-    for (let i = 0; i < defs.length; i++) {
-      const d = Math.hypot(defs[i].x - p.x, defs[i].z - p.z);
-      if (d < bestD) {
-        bestD = d;
-        best = i;
-      }
-    }
-    if (best < 0) return;
-
-    if (this.state.doors[best]) {
-      // never shut a door on somebody standing in the frame
-      const d = defs[best];
-      let occupied = false;
-      this.state.players.forEach((q) => {
-        if (Math.hypot(d.x - q.x, d.z - q.z) < DOOR_BLOCK_RADIUS) occupied = true;
-      });
-      if (occupied) return;
-    }
-    this.state.doors[best] = !this.state.doors[best];
-    this.refreshClosedDoors();
-    m.doorCooldownUntil = now + DOOR_COOLDOWN_MS;
   }
 
   // ---------- downed & revive ----------
@@ -495,7 +418,6 @@ export class GameRoom extends Room<GameState> {
       this.gen = generateLayout();
       this.state.layout = JSON.stringify(this.gen.descriptor);
     }
-    this.resetDoors();
 
     // Base difficulty is the player-count mode (solo = 15 items / quota 24 /
     // 6min, crew = 22 / 44 / 10min); the current shift escalates on top of it.
@@ -565,7 +487,6 @@ export class GameRoom extends Room<GameState> {
       m.lastMoveAt = now + IGNORE_MOVES_MS;
       m.staminaLocked = false;
       m.moveBudget = 1;
-      m.doorCooldownUntil = 0;
       m.lastReviveAt = now;
       m.reviveFedAt = 0;
       const tp: TeleportMessage = { x: spawn.x, z: spawn.z };
@@ -592,8 +513,6 @@ export class GameRoom extends Room<GameState> {
       spawn,
       isGateOpen: (gate: GateId) =>
         gate === "archives" ? this.state.archivesUnlocked : this.state.shortcutOpen,
-      closedDoors: () => this.closedDoors,
-      forceDoor: (index2: number) => this.forceDoor(index2),
     };
   }
 
@@ -863,7 +782,6 @@ export class GameRoom extends Room<GameState> {
       lastMoveAt: Date.now(),
       staminaLocked: false,
       moveBudget: 1,
-      doorCooldownUntil: 0,
       lastReviveAt: Date.now(),
       reviveFedAt: 0,
     });

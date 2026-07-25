@@ -16,11 +16,9 @@ export const MSG = {
   Restart: "restart",  // client -> server: start next round (from results)
   Teleport: "teleport", // server -> one client: hard reposition (round reset)
   Rtc: "rtc",          // WebRTC signaling, relayed peer-to-peer via the room
-  Door: "door",        // client -> server: toggle the nearest door
   Revive: "revive",    // client -> server: holding interact on a downed ally
   Buy: "buy",          // client -> server: purchase an upgrade between shifts
   Swap: "swap",        // client -> server: load a fresh flashlight cell
-  Forced: "forced",    // server -> clients: a monster tore a door open
 } as const;
 
 /** Client -> server -> target client: opaque WebRTC signaling payload. */
@@ -41,13 +39,6 @@ export interface TeleportMessage {
   z: number;
 }
 
-/** Server -> all clients: door `index` was torn open at this spot. */
-export interface ForcedMessage {
-  index: number;
-  x: number;
-  z: number;
-}
-
 /** Client -> server: buy one level of an upgrade. */
 export interface BuyMessage {
   id: string;
@@ -64,7 +55,6 @@ export interface EnemyStateData {
   z: number;
   yaw: number;
   aiState: AIState;
-  forcing: boolean;
 }
 
 export interface MoveMessage {
@@ -159,10 +149,3 @@ export const BLEED_OUT_SECONDS = 45;
 export const BLEED_TIME_PENALTY = 20;
 /** Invulnerability granted on being helped back to your feet. */
 export const REVIVE_INVULN_MS = 3000;
-
-// ---- doors ----
-export const DOOR_INTERACT_RADIUS = 2.2;
-/** A monster needs this long to tear a closed door open. */
-export const DOOR_FORCE_SECONDS = 2.2;
-/** Refuse to close a door with somebody standing in the frame. */
-export const DOOR_BLOCK_RADIUS = 1.0;

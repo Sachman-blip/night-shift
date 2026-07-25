@@ -1,15 +1,13 @@
-// Stealth / doors / gear / rescue / economy test.
+// Stealth / gear / rescue / economy test.
 //   npm run smoke:systems -w server        (sections 2+ need the server up)
 //
 // Sections, in dependency order (a failure stops everything after it):
-//   1. perception math — noise-scaled hearing, torch & crouch vision, and a
-//      shut door both hiding you AND holding the monster (pure, in-process)
-//   2. doors: a player can shut and reopen one, but not onto themselves
-//   3. noise tiers derive from the speed the SERVER observes
-//   4. flashlight battery drains on the beam, not the clock
-//   5. a monster tears a shut door open instead of giving up
-//   6. getting caught downs you; a teammate can pull you back up
-//   7. banking pays credits and the shop actually changes the run
+//   1. perception math — noise-scaled hearing, plus torch and crouch vision
+//      (pure, in-process)
+//   2. noise tiers derive from the speed the SERVER observes
+//   3. flashlight battery drains on the beam, not the clock
+//   4. getting caught downs you; a teammate can pull you back up
+//   5. banking pays credits and the shop actually changes the run
 //
 // The map is pinned (IDENTITY_LAYOUT) throughout so every coordinate below
 // is deterministic.
@@ -23,14 +21,12 @@ import {
   NOISE_WALK,
   NOISE_SPRINT,
   BASE_CELLS,
-  DOOR_FORCE_SECONDS,
   REVIVE_SECONDS,
   BLEED_OUT_SECONDS,
-  type ForcedMessage,
 } from "../../shared/messages";
 import { buildLayout, IDENTITY_LAYOUT } from "../../shared/map";
 import { CARRY_CAPACITY, carryCapacityFor, upgradeCost } from "../../shared/loot";
-import { createLos, toRect } from "../src/ai/los";
+import { createLos } from "../src/ai/los";
 import { createNav } from "../src/ai/nav";
 import { EnemyAI, type EnemyWorld } from "../src/ai/EnemyAI";
 import { Enemy, Player } from "../src/schema/GameState";
@@ -96,15 +92,12 @@ async function holdSpeed(
 // 1. perception math (pure)
 // ---------------------------------------------------------------------
 
-function makeWorld(closed: { index: number; rect: any }[] = [],
-                   onForce?: (i: number) => void): EnemyWorld {
+function makeWorld(): EnemyWorld {
   return {
     los, nav,
     route: L.patrolRoute,
     spawn: L.enemySpawn,
     isGateOpen: () => false,
-    closedDoors: () => closed,
-    forceDoor: (i) => onForce?.(i),
   };
 }
 
@@ -144,7 +137,7 @@ const FACE_NEG_X = Math.PI / 2;
 const FACE_NEG_Z = 0;
 
 function perceptionSection() {
-  console.log("[1] perception math (noise, torch, crouch, doors)");
+  console.log("[1] perception math (noise, torch, crouch)");
 
   // -- hearing scales with noise, and ignores walls by design --
   const listenerAt = { x: 0, z: 0, yaw: FACE_NEG_X };
@@ -185,62 +178,6 @@ function perceptionSection() {
     "...but not a crouched one (13 x 0.62 = 8.1m)"
   );
 
-  // -- a shut door hides you --
-  const doorRect = toRect(L.doors[1]);           // north slot 1 doorway, (0,-1.5)
-  const doorwayAt = { x: 0, z: 0, yaw: FACE_NEG_Z };
-  assert(
-    detects("stalker", doorwayAt, makePlayer(0, -5, { noise: NOISE_IDLE })),
-    "stalker sees a player 5m through an open doorway"
-  );
-  assert(
-    !detects("stalker", doorwayAt, makePlayer(0, -5, { noise: NOISE_IDLE }),
-      makeWorld([{ index: 1, rect: doorRect }])),
-    "...and loses them the moment the door is shut"
-  );
-
-  // -- and a shut door physically holds it, then loses --
-  console.log("[1b] a chasing monster is held by a shut door, then breaks it");
-  {
-    let forced: number | null = null;
-    let closed: { index: number; rect: any }[] = [];
-    const world = makeWorld([], (i) => (forced = i));
-    // closedDoors is read live, so swap the array contents mid-run
-    world.closedDoors = () => closed;
-
-    const e = new Enemy();
-    const ai = new EnemyAI(e, world);
-    ai.reset("stalker");
-    e.x = 0;
-    e.z = -0.5;
-    e.y = 1.05;
-    e.yaw = FACE_NEG_Z;
-
-    const player = makePlayer(0, -5, { noise: NOISE_IDLE });
-    const track = [{ sessionId: "s", player, invulnerable: false }];
-    const now = Date.now();
-
-    // one tick with the door open: it spots the player and commits to a chase
-    ai.update(0.05, now, track, () => {});
-    assert(e.aiState === "chase", "monster commits to the chase");
-
-    // now the door slams
-    closed = [{ index: 1, rect: doorRect }];
-    let elapsed = 0;
-    let minZ = e.z;
-    while (forced === null && elapsed < 5) {
-      elapsed += 0.05;
-      ai.update(0.05, now + elapsed * 1000, track, () => {});
-      minZ = Math.min(minZ, e.z);
-    }
-    assert(minZ > -1.5, `monster never crossed the panel (closest z=${minZ.toFixed(2)})`);
-    assert(forced === 1, "it forced door index 1 rather than giving up");
-    // chase-state scaling, plus the ~0.2s it spends closing the last metre
-    const want = DOOR_FORCE_SECONDS * 0.65;
-    assert(
-      elapsed >= want - 0.1 && elapsed <= want + 0.5,
-      `forcing took ~${want.toFixed(2)}s while chasing (actual ${elapsed.toFixed(2)}s)`
-    );
-  }
 }
 
 // ---------------------------------------------------------------------
@@ -248,43 +185,18 @@ function perceptionSection() {
 async function main() {
   perceptionSection();
 
-  // ---- 2. player-operated doors ----
-  console.log("[2] doors open and shut by hand");
+  // One quiet, monster-free room carries the noise and battery sections.
   const room = await new Client(ENDPOINT).create(ROOM_NAME, {
-    name: "Doorman", noEnemy: true, freeMove: true,
+    name: "Sneak", noEnemy: true, freeMove: true,
     layout: IDENTITY_LAYOUT, enemies: 1, roundSeconds: 600,
   });
   room.onMessage(MSG.Teleport, () => {});
-  await sleep(300);
-  {
-    const doorCount = snap(room).doors.length;
-    assert(doorCount === L.doors.length, `${doorCount} doors synced`);
-    assert(
-      snap(room).doors.every((d: boolean) => d === true),
-      "every door starts open"
-    );
+  // `players` itself is absent until the first patch lands, so reach for it
+  // defensively rather than assuming the map exists yet.
+  await waitFor(room, "test room ready", (s) => !!s.players?.[room.sessionId], 5000);
 
-    // 1.9m back from door 1 at (0,-1.5): inside interact range, outside the frame
-    sendPos(room, 0, -3.4);
-    await sleep(150);
-    room.send(MSG.Door);
-    await waitFor(room, "door 1 shut", (s) => s.doors[1] === false, 1500);
-
-    await sleep(450); // door cooldown
-    room.send(MSG.Door);
-    await waitFor(room, "door 1 opened again", (s) => s.doors[1] === true, 1500);
-
-    // standing in the frame: shutting it would trap the player in the panel
-    await sleep(450);
-    sendPos(room, 0, -1.6);
-    await sleep(150);
-    room.send(MSG.Door);
-    await sleep(400);
-    assert(snap(room).doors[1] === true, "cannot shut a door onto yourself");
-  }
-
-  // ---- 3. noise tiers from observed speed ----
-  console.log("[3] noise is derived from observed speed, not from the flag");
+  // ---- 2. noise tiers from observed speed ----
+  console.log("[2] noise is derived from observed speed, not from the flag");
   {
     sendPos(room, PARK.x, PARK.z);
     await sleep(200);
@@ -322,8 +234,8 @@ async function main() {
     );
   }
 
-  // ---- 4. flashlight battery ----
-  console.log("[4] flashlight battery");
+  // ---- 3. flashlight battery ----
+  console.log("[3] flashlight battery");
   {
     assert(me(room).cells === BASE_CELLS, `starts with ${BASE_CELLS} spare cell`);
     // the torch starts ON, so a sliver is already gone by the time we look
@@ -357,38 +269,8 @@ async function main() {
   }
   await room.leave();
 
-  // ---- 5. a monster forces a door it cannot get around ----
-  console.log("[5] a hunting monster tears a shut door open");
-  {
-    const hunt = await new Client(ENDPOINT).create(ROOM_NAME, {
-      name: "Bait", freeMove: true, layout: IDENTITY_LAYOUT,
-      variant: "listener", enemies: 1, roundSeconds: 600,
-    });
-    hunt.onMessage(MSG.Teleport, () => {});
-    let forced: ForcedMessage | null = null;
-    hunt.onMessage(MSG.Forced, (m: ForcedMessage) => (forced = m));
-
-    // shut door 1, then make a racket in the room behind it
-    sendPos(hunt, 0, -3.4);
-    await sleep(200);
-    hunt.send(MSG.Door);
-    await waitFor(hunt, "door 1 shut behind us", (s) => s.doors[1] === false, 2000);
-
-    // wait out the round-start grace, then sprint in place to be heard
-    await sleep(3600);
-    const spot = { x: 0, z: -5 };
-    const t0 = Date.now();
-    while (!forced && Date.now() - t0 < 25000) {
-      await holdSpeed(hunt, spot, 0.6, 4); // 6 m/s: loud enough for a listener
-    }
-    assert(forced, "monster broadcast a forced door");
-    assert((forced as any).index === 1, "it was the door we shut");
-    assert(snap(hunt).doors[1] === true, "and the door is open again");
-    await hunt.leave();
-  }
-
-  // ---- 6. downed & revive ----
-  console.log("[6] getting caught downs you; a teammate pulls you back up");
+  // ---- 4. downed & revive ----
+  console.log("[4] getting caught downs you; a teammate pulls you back up");
   {
     const clientA = new Client(ENDPOINT);
     const a = await clientA.create(ROOM_NAME, {
@@ -442,8 +324,8 @@ async function main() {
     await b.leave();
   }
 
-  // ---- 7. credits & the shop ----
-  console.log("[7] banking pays credits and the shop changes the next shift");
+  // ---- 5. credits & the shop ----
+  console.log("[5] banking pays credits and the shop changes the next shift");
   {
     const shop = await new Client(ENDPOINT).create(ROOM_NAME, {
       name: "Buyer", noEnemy: true, freeMove: true,
