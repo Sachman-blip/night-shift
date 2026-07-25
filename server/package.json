@@ -15,6 +15,7 @@
     "smoke:stamina": "tsx scripts/smoke-stamina.ts",
     "smoke:assembly": "tsx scripts/smoke-assembly.ts",
     "smoke:systems": "tsx scripts/smoke-systems.ts",
+    "smoke:reroll": "tsx scripts/smoke-reroll.ts",
     "smoke:voice": "tsx scripts/smoke-voice.ts"
   },
   "dependencies": {
