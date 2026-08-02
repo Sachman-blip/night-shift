@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: night-shift
+    runtime: node
+    plan: free
+    # Colyseus keeps all room state in memory and has no Redis presence driver,
+    # so every player must land on the same process. Never scale this past 1.
+    numInstances: 1
+    buildCommand: npm ci
+    startCommand: npm run start -w server
+    envVars:
+      - key: NODE_VERSION
+        value: "22.11.0"

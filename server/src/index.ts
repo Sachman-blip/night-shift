@@ -12,7 +12,7 @@ console.log("[server] layout self-test passed");
 
 // Stay-alive safety net: a bug in one room tick shouldn't take the whole
 // server (and every other room) down. Log it loudly and keep serving —
-// Railway's ALWAYS restart policy still covers hard crashes.
+// the host's restart policy still covers hard crashes.
 process.on("uncaughtException", (err) => {
   console.error("[server] uncaught exception (kept alive):", err);
 });
