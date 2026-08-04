@@ -19,6 +19,9 @@
     "smoke:voice": "tsx scripts/smoke-voice.ts"
   },
   "dependencies": {
+    "@colyseus/core": "0.16.24",
+    "@colyseus/redis-driver": "0.16.1",
+    "@colyseus/redis-presence": "0.16.4",
     "@colyseus/schema": "^3.0.76",
     "@colyseus/ws-transport": "0.16.5",
     "colyseus": "0.16.5",
