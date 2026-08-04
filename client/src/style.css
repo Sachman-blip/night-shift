@@ -120,6 +120,9 @@ canvas { display: block; }
   min-height: 14px;
 }
 
+/* waiting on a cold server is a status, not a failure — drop the alarm red */
+#menuError.waking { color: #6f7a6a; }
+
 /* ---------- HUD ---------- */
 #hud { position: fixed; inset: 0; pointer-events: none; z-index: 10; }
 

@@ -1,4 +1,6 @@
+import { createServer } from "http";
 import { Server } from "colyseus";
+import { WebSocketTransport } from "@colyseus/ws-transport";
 import { GameRoom } from "./rooms/GameRoom";
 import { generateLayout } from "./layout";
 import { IDENTITY_LAYOUT } from "../../shared/map";
@@ -22,7 +24,34 @@ process.on("unhandledRejection", (reason) => {
 
 const port = Number(process.env.PORT ?? 2567);
 
-const gameServer = new Server();
+// The default transport only ever answers WebSocket upgrades, so a plain GET
+// hangs forever. Free hosts idle the process out and restart it on the next
+// inbound HTTP request — a cold boot runs close to a minute, far longer than
+// either a socket connect or a matchmaking POST will wait. Serving one cheap
+// route the client can poll turns "can't reach the server" into a slow join,
+// and gives the host something real to health-check.
+//
+// Colyseus re-wires this listener rather than replacing it: attachMatchMakingRoutes
+// preserves handlers already on the server and only intercepts /matchmake.
+const httpServer = createServer((req, res) => {
+  if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
+    res.writeHead(200, {
+      "content-type": "application/json",
+      // the client is served from another origin (Vercel), so the wake-up
+      // probe is cross-origin and needs this to be readable
+      "access-control-allow-origin": "*",
+      "cache-control": "no-store",
+    });
+    res.end(JSON.stringify({ ok: true, rooms: ROOM_NAME }));
+    return;
+  }
+  res.writeHead(404, { "content-type": "text/plain" });
+  res.end("not found");
+});
+
+const gameServer = new Server({
+  transport: new WebSocketTransport({ server: httpServer }),
+});
 gameServer.define(ROOM_NAME, GameRoom);
 
 gameServer.listen(port).then(() => {

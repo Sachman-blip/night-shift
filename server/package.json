@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@colyseus/schema": "^3.0.76",
+    "@colyseus/ws-transport": "0.16.5",
     "colyseus": "0.16.5",
     "tsx": "^4.22.0"
   },

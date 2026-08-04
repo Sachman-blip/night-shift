@@ -8,6 +8,9 @@ services:
     numInstances: 1
     buildCommand: npm ci
     startCommand: npm run start -w server
+    # Plain GET route the server answers directly; everything else on the
+    # socket is a WebSocket upgrade that a health probe cannot speak.
+    healthCheckPath: /health
     envVars:
       - key: NODE_VERSION
         value: "22.11.0"

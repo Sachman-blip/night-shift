@@ -1,5 +1,5 @@
 import type { Room } from "colyseus.js";
-import { createRoom, joinRoom } from "./net";
+import { createRoom, joinRoom, wakeServer } from "./net";
 import { Game } from "./game/Game";
 
 const menu = document.getElementById("menu")!;
@@ -18,12 +18,22 @@ async function enter(connect: () => Promise<Room>) {
   createBtn.disabled = joinBtn.disabled = true;
   menuError.textContent = "";
   try {
+    // free-tier server may be asleep; this returns instantly when it is awake
+    await wakeServer((seconds) => {
+      menuError.classList.add("waking");
+      menuError.textContent =
+        `waking the building up… ${seconds}s ` +
+        `(the server sleeps when nobody's on shift)`;
+    });
+    menuError.classList.remove("waking");
+    menuError.textContent = "";
     const room = await connect();
     menu.classList.add("hidden");
     hud.classList.remove("hidden");
     await new Game(room).start();
   } catch (err: any) {
     console.error(err);
+    menuError.classList.remove("waking");
     menuError.textContent = friendlyError(err);
     menu.classList.remove("hidden");
     hud.classList.add("hidden");
