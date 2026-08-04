@@ -1,0 +1,51 @@
+name: keep the game server warm
+
+# Render's free tier spins the server down after ~15 minutes without inbound
+# traffic, and the cold boot that follows runs close to a minute — which a
+# player spends sitting on the menu watching "waking the building up…". A cheap
+# GET on the health route often enough to beat that timer keeps the instance
+# up, so starting a shift is immediate.
+#
+# Every 5 minutes rather than every 10 because GitHub's scheduled runs are
+# best-effort and drift when the hosted runners are busy; a single skipped run
+# at a 10-minute cadence is enough of a gap to put the server back to sleep.
+# Actions minutes are free and unmetered on public repos, so the extra runs
+# cost nothing.
+#
+# Trade-off worth knowing: a free Render workspace includes 750 instance-hours
+# a month and staying awake around the clock burns roughly 730 of them. That
+# fits, but only just — adding a second free Render service, or trimming this
+# schedule to the hours anyone actually plays, is the lever if that ever bites.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: # so it can be poked by hand from the Actions tab
+
+permissions: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Knock on the health route
+        env:
+          HEALTH_URL: https://night-shift-3jv4.onrender.com/health
+        run: |
+          # A cold instance can hold the request for the length of its boot, and
+          # the first request after a wake is sometimes dropped outright, so be
+          # patient and retry rather than reporting a false alarm.
+          for attempt in 1 2 3; do
+            code=$(curl -s -m 90 -o /dev/null -w '%{http_code}' "$HEALTH_URL" || echo 000)
+            echo "attempt $attempt: HTTP $code"
+            if [ "$code" = "200" ]; then
+              echo "server is awake"
+              exit 0
+            fi
+            sleep 15
+          done
+          # Deliberately not a failure: this runs 288 times a day, and turning a
+          # server outage into 288 failure emails would bury the signal. A
+          # warning is visible in the Actions tab without the noise.
+          echo "::warning::server did not answer $HEALTH_URL after 3 attempts"
