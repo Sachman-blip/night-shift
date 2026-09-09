@@ -42,6 +42,12 @@ npm run dev        # starts server (ws://localhost:2567) + client (http://localh
 Open http://localhost:5173, hit **START A SHIFT**, and share the 4-letter
 code. Friends on the same LAN can join via `http://<your-ip>:5173`.
 
+A fresh clone needs nothing but `npm install` — everything the game and both
+deploys need is in the repo. `screenshots/` is git-ignored and regenerates
+from the scripts in `tools/`. For how the live game is hosted, and the
+Render/Vercel traps worth knowing before you touch either, see
+[DEPLOYMENT.md](DEPLOYMENT.md).
+
 The `smoke:*` scripts drive a real client against a running server, so start
 one first (`npm run dev:server`) — `smoke:assembly` is the exception and runs
 on its own.
