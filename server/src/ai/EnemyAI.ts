@@ -15,17 +15,25 @@ import {
 // `hear` is the radius against a NORMAL walking player; it is scaled by the
 // player's live noise factor (0.25 idle .. 1.75 sprinting), so the numbers
 // below are the middle of a range rather than a fixed bubble.
+//
+// Chase speeds sit deliberately between WALK and SPRINT: walking away from a
+// hunt never works, sprinting always opens a gap. The gap is small enough
+// (1.3 m/s at worst) that one stamina bar buys a corner, not a lap of the map.
 export const ENEMY_VARIANTS = {
   // baseline hunter: sees far, hears little
-  stalker: { patrol: 1.7, search: 2.4, chase: 4.3, hear: 4, vision: 13 },
+  stalker: { patrol: 1.5, search: 2.0, chase: 3.8, hear: 4, vision: 13 },
   // near-blind, hears you through walls from across a room - sneak or die
-  listener: { patrol: 1.4, search: 2.2, chase: 4.0, hear: 9, vision: 8 },
-  // fast and twitchy: chase nearly matches sprint, but poor senses
-  sprinter: { patrol: 2.2, search: 2.6, chase: 5.2, hear: 3, vision: 11 },
+  listener: { patrol: 1.25, search: 1.8, chase: 3.5, hear: 9, vision: 8 },
+  // fast and twitchy: still the one you cannot outlast, but poor senses
+  sprinter: { patrol: 1.9, search: 2.2, chase: 4.5, hear: 3, vision: 11 },
 } as const;
 export type EnemyVariant = keyof typeof ENEMY_VARIANTS;
 const VISION_COS = Math.cos((50 * Math.PI) / 180);
-const LOSE_SIGHT_MS = 2500;
+const LOSE_SIGHT_MS = 1800;
+// Beat of stillness when a hunt starts: it locks onto you and *waits* before
+// coming. Reads as a decision being made, and hands you the head start that
+// makes breaking line of sight a real option.
+const NOTICE_FREEZE_MS = 450;
 const SEARCH_LINGER_MS = 4000;
 const KILL_RADIUS = 1.1;
 const KILL_HEIGHT = 1.6;
@@ -51,6 +59,7 @@ export class EnemyAI {
   private lastKnown = { x: 0, z: 0 };
   private lastDetectedAt = 0;
   private searchArrivedAt: number | null = null;
+  private noticeUntil = 0;
   private tune: (typeof ENEMY_VARIANTS)[EnemyVariant] = ENEMY_VARIANTS.stalker;
 
   constructor(private enemy: Enemy, private world: EnemyWorld) {
@@ -80,6 +89,7 @@ export class EnemyAI {
     this.lastKnown = { x: spawn.x, z: spawn.z };
     this.lastDetectedAt = 0;
     this.searchArrivedAt = null;
+    this.noticeUntil = 0;
     // resume at the route stop nearest this enemy's own spawn, so multiple
     // enemies sharing the route start spread out instead of converging
     this.toPatrol();
@@ -91,6 +101,7 @@ export class EnemyAI {
     this.enemy.z = z;
     this.enemy.aiState = "patrol";
     this.searchArrivedAt = null;
+    this.noticeUntil = 0;
     this.toPatrol();
   }
 
@@ -138,6 +149,7 @@ export class EnemyAI {
       }
     }
     if (nearest) {
+      if (e.aiState !== "chase") this.noticeUntil = now + NOTICE_FREEZE_MS;
       e.aiState = "chase";
       this.lastKnown.x = nearest.player.x;
       this.lastKnown.z = nearest.player.z;
@@ -146,6 +158,11 @@ export class EnemyAI {
 
     switch (e.aiState) {
       case "chase": {
+        // the beat before the sprint: stand still, but turn to face you
+        if (now < this.noticeUntil) {
+          this.faceToward(this.lastKnown.x, this.lastKnown.z);
+          break;
+        }
         this.navigateToward(this.lastKnown.x, this.lastKnown.z, this.tune.chase, dt, gates);
         if (now - this.lastDetectedAt > LOSE_SIGHT_MS) {
           e.aiState = "search";
@@ -234,6 +251,15 @@ export class EnemyAI {
     const n = nav.nodes[path[i]];
     this.stepToward(n.x, n.z, speed, dt);
     return false;
+  }
+
+  /** Turn to look at a point without moving an inch. */
+  private faceToward(tx: number, tz: number) {
+    const e = this.enemy;
+    const dx = tx - e.x;
+    const dz = tz - e.z;
+    if (dx === 0 && dz === 0) return;
+    e.yaw = Math.atan2(-dx, -dz);
   }
 
   private stepToward(tx: number, tz: number, speed: number, dt: number): boolean {

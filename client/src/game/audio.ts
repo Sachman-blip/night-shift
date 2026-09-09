@@ -11,7 +11,7 @@
 
 type StingKind =
   | "pickup" | "bank" | "death" | "win" | "loss" | "unlock"
-  | "revive" | "cell" | "buy";
+  | "revive" | "cell" | "buy" | "spotted";
 
 const ENEMY_AUDIO_RANGE = 25; // silent beyond this distance (m)
 
@@ -19,6 +19,8 @@ export class AudioEngine {
   private ctx: AudioContext | null = null;
   private master!: GainNode;
   private enemyGain!: GainNode;
+  private enemyFilter!: BiquadFilterNode;
+  private growls: OscillatorNode[] = [];
   private noiseBuf!: AudioBuffer;
   private heartbeatIn = 0;
 
@@ -89,6 +91,7 @@ export class AudioEngine {
     lp.type = "lowpass";
     lp.frequency.value = 320;
     lp.connect(this.enemyGain).connect(this.master);
+    this.enemyFilter = lp;
 
     // sub + dissonant tritone growl
     for (const [freq, type, vol] of [
@@ -103,7 +106,18 @@ export class AudioEngine {
       g.gain.value = vol;
       osc.connect(g).connect(lp);
       osc.start();
+      this.growls.push(osc);
     }
+
+    // slow irregular wobble on the growl — a throat, not a synth pad
+    const wobble = ctx.createOscillator();
+    wobble.type = "triangle";
+    wobble.frequency.value = 0.23;
+    const wobbleGain = ctx.createGain();
+    wobbleGain.gain.value = 11;
+    wobble.connect(wobbleGain);
+    for (const osc of this.growls) wobbleGain.connect(osc.detune);
+    wobble.start();
   }
 
   /** Per-frame: drives the enemy proximity layer. */
@@ -113,7 +127,17 @@ export class AudioEngine {
 
     const prox = Math.max(0, Math.min(1, 1 - enemyDist / ENEMY_AUDIO_RANGE));
     const intensity = active ? prox * prox * (chasing ? 1 : 0.5) : 0;
-    this.enemyGain.gain.setTargetAtTime(intensity * 0.16, ctx.currentTime, 0.2);
+    this.enemyGain.gain.setTargetAtTime(intensity * 0.2, ctx.currentTime, 0.2);
+
+    // the growl climbs and opens up as it closes on you: a snarl building in
+    // something's chest, not a fixed drone getting louder
+    const drive = active ? prox * (chasing ? 1 : 0.45) : 0;
+    for (const osc of this.growls) {
+      osc.detune.setTargetAtTime(drive * 130, ctx.currentTime, 0.35);
+    }
+    this.enemyFilter.frequency.setTargetAtTime(
+      320 + drive * 620, ctx.currentTime, 0.35
+    );
 
     if (intensity > 0.02) {
       this.heartbeatIn -= dt;
@@ -218,6 +242,29 @@ export class AudioEngine {
         this.tone(700, "triangle", t, 0.08, 0.07);
         this.tone(1050, "triangle", t + 0.08, 0.14, 0.06);
         break;
+      case "spotted": {
+        // it has seen you. Shriek: two detuned saws tearing upward over a
+        // sub drop, with a noise rasp on top so it never sounds musical.
+        this.tone(340, "sawtooth", t, 0.5, 0.055, 1250);
+        this.tone(357, "sawtooth", t, 0.5, 0.045, 1190);
+        this.tone(140, "sine", t, 0.7, 0.13, 44);
+        const src = ctx.createBufferSource();
+        src.buffer = this.noiseBuf;
+        src.playbackRate.value = 1.4;
+        const bp = ctx.createBiquadFilter();
+        bp.type = "bandpass";
+        bp.frequency.setValueAtTime(900, t);
+        bp.frequency.exponentialRampToValueAtTime(2600, t + 0.4);
+        bp.Q.value = 4;
+        const g = ctx.createGain();
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.09, t + 0.09);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + 0.55);
+        src.connect(bp).connect(g).connect(this.master);
+        src.start(t);
+        src.stop(t + 0.6);
+        break;
+      }
     }
   }
 

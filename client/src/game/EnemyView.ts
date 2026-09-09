@@ -27,9 +27,13 @@ interface Rig {
 /**
  * Three primitive-composed monsters, one per server variant, with
  * procedural animation per AI state:
- *   patrol — slow, almost-normal limb swing; wrongness only up close
+ *   patrol — slow, almost-normal limb swing, broken by rare violent twitches
  *   chase  — time-quantized jerky flail, forward lean, hard yaw snaps
  *   search — dead still, instant head-snaps, occasional full freezes
+ *
+ * The server holds a monster still for ~450ms when a hunt starts; the client
+ * spends that beat rearing up and locking its head onto you (`noticeT`), so
+ * the pause reads as intent rather than as a network hitch.
  */
 export class EnemyView {
   private group = new THREE.Group();
@@ -44,6 +48,9 @@ export class EnemyView {
   private snapIn = 1;
   private freezeFor = 0;
   private blinkIn = 3;
+  private noticeT = 0;   // 1 -> 0 over the rear-up when a hunt begins
+  private twitchIn = 4;  // countdown to the next patrol twitch
+  private twitchFor = 0;
 
   constructor(private scene: THREE.Scene) {
     scene.add(this.group);
@@ -159,6 +166,11 @@ export class EnemyView {
     if (e.aiState !== this.aiState) {
       this.aiState = e.aiState;
       this.eyeMat.color.setHex(EYE_COLORS[this.aiState] ?? EYE_COLORS.patrol);
+      // entering a hunt: rear up, and drop any search freeze mid-hold
+      if (this.aiState === "chase") {
+        this.noticeT = 1;
+        this.freezeFor = 0;
+      }
     }
   }
 
@@ -184,11 +196,33 @@ export class EnemyView {
       return;
     }
 
-    // blink: eyes briefly collapse
+    // blink: eyes briefly collapse. Hunting eyes swell and burn unsteadily,
+    // so the thing looks lit from inside rather than merely reflective.
     this.blinkIn -= dt;
     if (this.blinkIn <= 0) this.blinkIn = 2 + Math.random() * 5;
     const blink = this.blinkIn < 0.12 ? 0.1 : 1;
-    for (const e of this.eyes) e.scale.setY(blink);
+    const glow = chase
+      ? 1.55 + Math.sin(this.animT * 17) * 0.12 + Math.random() * 0.1
+      : search
+        ? 1.15
+        : 1;
+    for (const e of this.eyes) e.scale.set(glow, glow * blink, glow);
+
+    // the rear-up: it has seen you and is deciding. Body pulls back and up,
+    // head locks dead ahead, then everything unloads into the run.
+    if (this.noticeT > 0) {
+      this.noticeT = Math.max(0, this.noticeT - dt / 0.45);
+      const rise = Math.sin((1 - this.noticeT) * Math.PI); // 0 -> 1 -> 0
+      r.body.rotation.x = -0.3 * rise;
+      r.head.rotation.y = 0;
+      r.head.rotation.z = 0.35 * rise;
+      r.armL.rotation.x = -1.1 * rise;
+      r.armR.rotation.x = -0.85 * rise;
+      r.legL.rotation.x = 0;
+      r.legR.rotation.x = 0;
+      this.group.position.y = this.targetPos.y + rise * 0.12;
+      return;
+    }
 
     if (search) {
       // settle limbs, then instant head-snaps toward nothing in particular
@@ -196,28 +230,59 @@ export class EnemyView {
         limb.rotation.x *= Math.max(0, 1 - dt * 6);
       }
       r.body.rotation.x *= Math.max(0, 1 - dt * 4);
+      r.head.rotation.z *= Math.max(0, 1 - dt * 5);
       this.snapIn -= dt;
       if (this.snapIn <= 0) {
         this.snapIn = 0.7 + Math.random() * 1.1;
         r.head.rotation.y = (Math.random() - 0.5) * 2.6; // no tween: snap
+        // a head that ends up cocked at an angle no neck should allow
+        if (Math.random() < 0.45) r.head.rotation.z = (Math.random() - 0.5) * 1.5;
         if (Math.random() < 0.3) this.freezeFor = 0.25 + Math.random() * 0.45;
       }
       return;
     }
 
-    // patrol/chase locomotion
-    this.animT += dt * (chase ? 9.5 : 2.4);
+    // patrol/chase locomotion. The patrol cycle is slow enough to look like a
+    // drag rather than a walk — it now matches the reduced server speed.
+    this.animT += dt * (chase ? 9.5 : 1.9);
     // chase runs on quantized time: motion updates in visible steps
     const t = chase ? this.animT - (this.animT % 0.22) : this.animT;
     const amp = chase ? 0.85 : 0.3;
     const swing = Math.sin(t);
+
+    // a patrolling monster is calm until, for no reason at all, it is not:
+    // one frame of whole-body seizure, then straight back to the drag
+    if (!chase) {
+      this.twitchIn -= dt;
+      if (this.twitchIn <= 0) {
+        this.twitchIn = 3.5 + Math.random() * 7;
+        this.twitchFor = 0.12 + Math.random() * 0.16;
+      }
+      if (this.twitchFor > 0) this.twitchFor -= dt;
+    }
+    const seizing = this.twitchFor > 0;
+
     r.armL.rotation.x = swing * amp * 1.15;
     r.armR.rotation.x = -swing * amp * 0.8;      // asymmetric arm swing
     r.legL.rotation.x = -swing * amp * (this.variant === "sprinter" ? 0.5 : 0.7) +
       (this.variant === "sprinter" ? 0.5 : 0);
     r.legR.rotation.x = swing * amp * 0.65 + (this.variant === "sprinter" ? 0.55 : 0);
     r.body.rotation.x = chase ? 0.32 : 0.04 + Math.sin(t * 0.5) * 0.02;
-    r.head.rotation.y = chase ? 0 : Math.sin(this.animT * 0.31) * 0.35;
+    // chase: the head lolls loose on the neck instead of tracking straight
+    r.head.rotation.y = chase
+      ? Math.sin(this.animT * 2.7) * 0.22
+      : Math.sin(this.animT * 0.31) * 0.35;
+    r.head.rotation.z = chase ? Math.sin(this.animT * 1.3) * 0.3 : 0;
+
+    if (seizing) {
+      const j = () => (Math.random() - 0.5) * 1.4;
+      r.head.rotation.y += j();
+      r.head.rotation.z += j() * 0.5;
+      r.armL.rotation.x += j();
+      r.armR.rotation.x += j();
+      r.body.rotation.x += j() * 0.2;
+    }
+
     this.group.position.y =
       this.targetPos.y + Math.abs(Math.sin(t)) * (chase ? 0.07 : 0.025);
   }

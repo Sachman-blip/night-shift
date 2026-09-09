@@ -83,6 +83,7 @@ export class Game {
   private prevArchives = false;
   private prevShortcut = false;
   private prevDowned = false;
+  private hunting = new Set<string>(); // enemy ids currently chasing
   private ambientIn = 20;
   private composer!: EffectComposer;
   private grainPass!: ShaderPass;
@@ -213,6 +214,7 @@ export class Game {
     if (self) this.controller.teleport(self.x, 1.05, self.z);
     this.prevArchives = false;
     this.prevShortcut = false;
+    this.hunting.clear();
     this.toast("THE FLOOR PLAN IS NOT THE ONE YOU LEARNED");
   }
 
@@ -530,7 +532,9 @@ export class Game {
     let enemyDist = Infinity;
     let enemyChasing = false;
     let bestScore = -1;
-    st.enemies.forEach((e: any) => {
+    let newHunt = false;
+    const stillHunting = new Set<string>();
+    st.enemies.forEach((e: any, id: string) => {
       const d = Math.hypot(
         e.x - this.camera.position.x,
         e.y - this.camera.position.y,
@@ -543,7 +547,15 @@ export class Game {
         enemyDist = d;
         enemyChasing = e.aiState === "chase";
       }
+      // the shriek fires on the transition into a hunt, and only for monsters
+      // near enough to actually be heard — distant ones stay a rumour
+      if (e.aiState === "chase") {
+        stillHunting.add(id);
+        if (!this.hunting.has(id) && d < 30) newHunt = true;
+      }
     });
+    this.hunting = stillHunting;
+    if (newHunt && active) this.audio.sting("spotted");
     this.audio.update(enemyDist, enemyChasing, active, dt);
 
     // close-chase panic: camera breathing + vignette/grain surge. Being on
